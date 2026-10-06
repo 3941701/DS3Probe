@@ -1,40 +1,25 @@
-name: Build dinput8
+name: Build DS3Probe
 
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
-      - name: Setup MSVC x86
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x86
+      - name: Configure (Win32, Release)
+        run: cmake -S . -B build -A Win32
 
-      - name: Build DLL
-        shell: cmd
-        run: |
-          if not exist build mkdir build
+      - name: Build
+        run: cmake --build build --config Release
 
-          cl /nologo /std:c++23preview /EHsc /LD ^
-            /I include ^
-            src\DS3Probe.cpp ^
-            include\safetyhook\safetyhook.cpp ^
-            include\safetyhook\Zydis.c ^
-            /link ^
-            /DEF:src\dinput8.def ^
-            /OUT:build\dinput8.dll
-
-      - name: Upload DLL
+      - name: Upload dinput8.dll
         uses: actions/upload-artifact@v4
         with:
-          name: dinput8-win32
-          path: build\dinput8.dll
+          name: dinput8
+          path: build/Release/dinput8.dll
