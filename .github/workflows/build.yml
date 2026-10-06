@@ -1,10 +1,9 @@
 name: Build dinput8
 
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [ "main", "master" ] # Сборка будет запускаться автоматически при пуше
+  workflow_dispatch:            # И вручную кнопкой
 
 jobs:
   build:
@@ -12,24 +11,29 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
-      - name: Setup MSBuild
-        uses: microsoft/setup-msbuild@v3
+      - name: Setup MSVC x86
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
 
-      - name: Build Release Win32
+      - name: Build DLL
         shell: cmd
         run: |
-          msbuild dinput8.sln ^
-            /m ^
-            /p:Configuration=Release ^
-            /p:Platform=Win32 ^
-            /v:minimal
+          if not exist build mkdir build
+
+          cl /nologo /O2 /std:c++20 /EHsc /LD ^
+            /I include ^
+            /I include\safetyhook ^
+            src\DS3Probe.cpp ^
+            include\safetyhook\Zydis.c ^
+            /link ^
+            /DEF:src\dinput8.def ^
+            /OUT:build\dinput8.dll
 
       - name: Upload DLL
         uses: actions/upload-artifact@v4
         with:
           name: dinput8-win32
-          path: |
-            **\Release\dinput8.dll
-            **\Win32\Release\dinput8.dll
+          path: build\dinput8.dll
