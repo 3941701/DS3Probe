@@ -1,0 +1,28 @@
+name: Build MSVC Project
+
+on:
+  push:
+    branches: [ "main", "master" ] # Замените на имя вашей основной ветки, если оно другое
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch: # Позволяет запускать сборку вручную кнопкой
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Build App
+      run: msbuild dinput8.sln /p:Configuration=Release /p:Platform=Win32
+
+    - name: Upload Build Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: dinput8-dll
+        path: Release/dinput8.dll
