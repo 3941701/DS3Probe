@@ -1,9 +1,10 @@
 name: Build dinput8
 
 on:
+  workflow_dispatch:
   push:
-    branches: [ "main", "master" ] # Сборка будет запускаться автоматически при пуше
-  workflow_dispatch:            # И вручную кнопкой
+    branches:
+      - main
 
 jobs:
   build:
@@ -11,7 +12,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup MSVC x86
         uses: ilammy/msvc-dev-cmd@v1
@@ -23,10 +24,10 @@ jobs:
         run: |
           if not exist build mkdir build
 
-          cl /nologo /O2 /std:c++20 /EHsc /LD ^
+          cl /nologo /std:c++20 /EHsc /LD ^
             /I include ^
-            /I include\safetyhook ^
             src\DS3Probe.cpp ^
+            include\safetyhook\safetyhook.cpp ^
             include\safetyhook\Zydis.c ^
             /link ^
             /DEF:src\dinput8.def ^
