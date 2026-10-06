@@ -24,7 +24,7 @@ jobs:
         run: |
           if not exist build mkdir build
 
-          cl /nologo /std:c++20 /EHsc /LD ^
+          cl /nologo /std:c++23 /EHsc /LD ^
             /I include ^
             src\DS3Probe.cpp ^
             include\safetyhook\safetyhook.cpp ^
