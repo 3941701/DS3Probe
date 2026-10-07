@@ -1,24 +1,20 @@
-﻿// ============================================================================
-// DS3Probe - прокси dinput8.dll для Dead Space 3.
-// НИЧЕГО НЕ ЧИНИТ. Только собирает данные, чтобы проверять гипотезы без отладчика.
+// ============================================================================
+// DS3Probe v2 - прокси dinput8.dll для Dead Space 3. НИЧЕГО НЕ ЧИНИТ, только собирает данные.
 //
-// Что делает:
-//  1. Хукает user32: GetCursorPos / SetCursorPos / ClipCursor / ShowCursor
-//     (счётчики + таблица "кто вызывает" с адресами в формате Ghidra).
-//  2. Оборачивает DirectInput8: какие устройства создаёт игра (мышь или нет),
-//     режим SetCooperativeLevel, читается ли мышь через GetDeviceState/Data.
-//  3. Ставит mid-хуки по адресам из Ghidra (Mouse_GetState, Mouse_WndMsg,
-//     PollMouseCursor, InputMapper_Update) - только считает, ничего не меняет.
-//  4. В своём потоке слушает Raw Input (эталон: сколько счётов отдала мышь на самом деле).
-//  5. Раз в секунду пишет сводку, по хоткеям - захват сэмплов в CSV.
+// Что изменилось относительно v1 (причина: v1 ставила хуки по адресам версии 1.0.0.0 в процесс
+// версии 1.0.0.1 - три из четырёх адресов попали в середину инструкций, игра зависала):
+//  * Адреса exe больше НЕ зашиты в код. Без файла ds3probe.cfg хуки по адресам exe не ставятся вообще
+//    (работают user32 / DirectInput / Raw Input - они от версии не зависят).
+//  * ds3probe.cfg содержит Build (PE TimeDateStamp) - при несовпадении сборки хуки пропускаются,
+//    и необязательные .bytes - ожидаемые байты в начале функции (при несовпадении хук пропускается).
+//  * Захват пишет два CSV: _di (то, что игра получила от DirectInput-мыши) и _acc (аккумуляторы
+//    WM_MOUSEMOVE, если адреса заданы в cfg) - каждый сравнивается с Raw Input.
+//  * Все строки лога - ASCII (в v1 кириллица в логе превращалась в '?').
 //
-// Хоткеи (работают, только когда окно игры в фокусе):
-//   F6 - маркер в логе + таблица "кто вызывает" (и сброс этой таблицы)
-//   F7 - начать захват (сэмплы raw vs game)
-//   F8 - закончить захват, записать ds3probe_cap_NNN.csv и итоги в лог
+// Хоткеи (только когда окно игры в фокусе): F6 - маркер + таблица "кто вызывает",
+// F7 - начать захват, F8 - закончить (CSV + итоги в лог).
 //
-// Сборка: см. README.md. Требует safetyhook (из репозитория MarkerPatch) и его dllmain.hpp.
-// Этот файл НЕ компилировался автором (нет Windows-тулчейна) - возможны мелкие правки.
+// Требует safetyhook (из MarkerPatch) и его src/dllmain.hpp. Автором не компилировалась.
 // ============================================================================
 #define _CRT_SECURE_NO_WARNINGS
 #define NOMINMAX
@@ -27,12 +23,15 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -41,26 +40,13 @@
 #include "safetyhook/safetyhook.hpp"
 #include "dllmain.hpp" // из MarkerPatch/src: struct dinput8 + naked-переходники (экспорты)
 
-// ----------------------------------------------------------------------------
-// Настройки. Адреса - ровно как в Ghidra (база образа берётся из PE-заголовка).
-// ----------------------------------------------------------------------------
-namespace cfg
+namespace opt
 {
-	constexpr uintptr_t kMouseGetState   = 0x0040A620; // Mouse_GetState  (то, что лежит в g_pfnMouseGetState)
-	constexpr uintptr_t kPollMouseCursor = 0x0040CC20; // PollMouseCursor
-	constexpr uintptr_t kWndMsg          = 0x0040D060; // Mouse_WndMsg    (WM_MOUSEMOVE и т.д.)
-	constexpr uintptr_t kInputMapper     = 0x00AC8210; // InputMapper_Update
-	constexpr uintptr_t kAccDX           = 0x011ACDD0; // g_mouseDX (аккумулятор, int)
-	constexpr uintptr_t kAccDY           = 0x011ACDD4; // g_mouseDY
-	constexpr uintptr_t kFlagCaptured    = 0x011ACDCE; // byte, рабочее имя g_mouseCaptured?
-	constexpr uintptr_t kFlagRecenter    = 0x011ACDEE; // byte, рабочее имя g_cursorRecenterDisabled
-
 	constexpr int kVkMarker = VK_F6;
 	constexpr int kVkStart  = VK_F7;
 	constexpr int kVkStop   = VK_F8;
-
-	constexpr int kMaxFirstLogs = 12;      // сколько первых вызовов каждого API писать подробно
-	constexpr int kWaitD3D9MaxMs = 30000;  // ждать загрузки d3d9.dll перед mid-хуками по адресам exe
+	constexpr int kMaxFirstLogs = 12;     // сколько первых вызовов каждого API писать подробно
+	constexpr int kWaitD3D9MaxMs = 30000; // задержка перед mid-хуками exe: ждём d3d9 (+1.5 с)
 }
 
 // ----------------------------------------------------------------------------
@@ -68,6 +54,7 @@ namespace cfg
 // ----------------------------------------------------------------------------
 static HMODULE   g_self = nullptr;
 static uintptr_t g_exeBase = 0, g_imageBase = 0;
+static uint32_t  g_timeDateStamp = 0, g_sizeOfImage = 0;
 static LARGE_INTEGER g_freq, g_t0;
 static FILE* g_log = nullptr;
 static std::mutex g_logMu;
@@ -125,6 +112,7 @@ template <class T> static bool ReadT(uintptr_t addr, T* out) { return ReadBytes(
 static uintptr_t Rebase(uintptr_t ghidraAddr) { return g_exeBase + (ghidraAddr - g_imageBase); }
 
 // "exe+0x... [ghidra 0040CC20]" или "d3d9.dll+0x..."
+// ВАЖНО: [ghidra ...] = база образа + RVA, то есть адрес в Ghidra-проекте ТОЙ ЖЕ версии exe, которая запущена.
 static std::string Where(const void* addr)
 {
 	char buf[320];
@@ -156,6 +144,89 @@ static bool GameFocused()
 }
 
 // ----------------------------------------------------------------------------
+// Конфиг ds3probe.cfg (необязателен). Формат: "ключ = значение", '#' - комментарий. Числа - hex.
+//   Build = 4F1A2B3C            (PE TimeDateStamp из лога; при несовпадении хуки exe пропускаются)
+//   MouseGetState = 0040A620    PollMouseCursor, WndMsg, InputMapper - функции (адрес НАЧАЛА функции)
+//   MouseGetState.bytes = 55 8B EC ?? ??   (необязательно: ожидаемые байты начала функции)
+//   AccDX / AccDY / FlagCaptured / FlagRecenter - адреса данных
+// ----------------------------------------------------------------------------
+struct Config
+{
+	bool loaded = false, hasBuild = false;
+	uint32_t build = 0;
+	uintptr_t mouseGetState = 0, pollMouseCursor = 0, wndMsg = 0, inputMapper = 0;
+	uintptr_t accDX = 0, accDY = 0, flagCaptured = 0, flagRecenter = 0;
+	std::string bMouseGetState, bPoll, bWndMsg, bMapper;
+};
+static Config g_cfg;
+
+static std::string Trim(const std::string& s)
+{
+	const size_t a = s.find_first_not_of(" \t\r\n");
+	if (a == std::string::npos) return "";
+	return s.substr(a, s.find_last_not_of(" \t\r\n") - a + 1);
+}
+static std::string Lower(std::string s) { for (char& c : s) c = (char)tolower((unsigned char)c); return s; }
+
+static void LoadConfig()
+{
+	FILE* f = nullptr;
+	_wfopen_s(&f, MakePath(L"ds3probe.cfg").c_str(), L"rt");
+	if (!f) { Log("no ds3probe.cfg -> exe-address hooks DISABLED (safe mode); user32/DirectInput/RawInput probes still work"); return; }
+	char line[512];
+	while (fgets(line, sizeof(line), f))
+	{
+		std::string s = line;
+		const size_t h = s.find('#');
+		if (h != std::string::npos) s.erase(h);
+		const size_t eq = s.find('=');
+		if (eq == std::string::npos) continue;
+		const std::string k = Lower(Trim(s.substr(0, eq))), v = Trim(s.substr(eq + 1));
+		if (k.empty() || v.empty()) continue;
+		const uintptr_t n = (uintptr_t)strtoul(v.c_str(), nullptr, 16);
+		if (k == "build") { g_cfg.hasBuild = true; g_cfg.build = (uint32_t)n; }
+		else if (k == "mousegetstate") g_cfg.mouseGetState = n;
+		else if (k == "pollmousecursor") g_cfg.pollMouseCursor = n;
+		else if (k == "wndmsg") g_cfg.wndMsg = n;
+		else if (k == "inputmapper") g_cfg.inputMapper = n;
+		else if (k == "accdx") g_cfg.accDX = n;
+		else if (k == "accdy") g_cfg.accDY = n;
+		else if (k == "flagcaptured") g_cfg.flagCaptured = n;
+		else if (k == "flagrecenter") g_cfg.flagRecenter = n;
+		else if (k == "mousegetstate.bytes") g_cfg.bMouseGetState = v;
+		else if (k == "pollmousecursor.bytes") g_cfg.bPoll = v;
+		else if (k == "wndmsg.bytes") g_cfg.bWndMsg = v;
+		else if (k == "inputmapper.bytes") g_cfg.bMapper = v;
+		else Log("cfg: unknown key '%s'", k.c_str());
+	}
+	fclose(f);
+	g_cfg.loaded = true;
+	Log("cfg loaded: Build=%s%08X MouseGetState=%08X Poll=%08X WndMsg=%08X Mapper=%08X AccDX=%08X AccDY=%08X",
+		g_cfg.hasBuild ? "" : "(none) ", (unsigned)g_cfg.build, (unsigned)g_cfg.mouseGetState, (unsigned)g_cfg.pollMouseCursor,
+		(unsigned)g_cfg.wndMsg, (unsigned)g_cfg.inputMapper, (unsigned)g_cfg.accDX, (unsigned)g_cfg.accDY);
+}
+
+// "55 8B EC ?? ?? 8B" против памяти по адресу
+static bool BytesMatch(uintptr_t addr, const std::string& pattern)
+{
+	if (pattern.empty()) return true;
+	std::vector<int> pat;
+	std::istringstream is(pattern);
+	std::string tok;
+	while (is >> tok)
+	{
+		if (tok[0] == '?') pat.push_back(-1);
+		else pat.push_back((int)strtoul(tok.c_str(), nullptr, 16));
+	}
+	if (pat.empty()) return true;
+	std::vector<uint8_t> mem(pat.size());
+	if (!ReadBytes(addr, mem.data(), mem.size())) return false;
+	for (size_t i = 0; i < pat.size(); ++i)
+		if (pat[i] >= 0 && pat[i] != mem[i]) return false;
+	return true;
+}
+
+// ----------------------------------------------------------------------------
 // Счётчики
 // ----------------------------------------------------------------------------
 enum Counter
@@ -181,7 +252,7 @@ static std::mutex g_callMu;
 static std::unordered_map<uintptr_t, uint64_t> g_callers[C_COUNT];
 
 static void Count(Counter id, uint64_t n = 1) { g_cnt[id].fetch_add(n, std::memory_order_relaxed); }
-static bool FirstN(Counter id) { return g_firstLogged[id].fetch_add(1, std::memory_order_relaxed) < cfg::kMaxFirstLogs; }
+static bool FirstN(Counter id) { return g_firstLogged[id].fetch_add(1, std::memory_order_relaxed) < opt::kMaxFirstLogs; }
 static void NoteCaller(Counter id, void* ra)
 {
 	std::lock_guard<std::mutex> lk(g_callMu);
@@ -191,15 +262,17 @@ static void NoteCaller(Counter id, void* ra)
 // ----------------------------------------------------------------------------
 // Сырой ввод (эталон) и захват
 // ----------------------------------------------------------------------------
-static std::atomic<LONG> g_rawPairX{ 0 }, g_rawPairY{ 0 }; // обнуляются в Mouse_GetState (парные с сэмплом)
-static std::atomic<LONG> g_rawRepX{ 0 }, g_rawRepY{ 0 };   // обнуляются в секундной сводке
-static std::atomic<LONG> g_rawCapX{ 0 }, g_rawCapY{ 0 };   // за время захвата
-static std::atomic<LONG> g_diCapX{ 0 }, g_diCapY{ 0 };     // сумма DirectInput-мыши за захват
+// Отдельные "парные" накопители для каждого источника сэмплов, чтобы они не воровали счёты друг у друга
+static std::atomic<LONG> g_rawPairAccX{ 0 }, g_rawPairAccY{ 0 };
+static std::atomic<LONG> g_rawPairDiX{ 0 },  g_rawPairDiY{ 0 };
+static std::atomic<LONG> g_rawRepX{ 0 },  g_rawRepY{ 0 };   // для секундной сводки
+static std::atomic<LONG> g_rawCapX{ 0 },  g_rawCapY{ 0 };   // за время захвата
+static std::atomic<LONG> g_diCapX{ 0 },   g_diCapY{ 0 };    // сумма DirectInput-мыши за захват
 
 struct Sample { double t; LONG rx, ry; int gx, gy; };
 static std::atomic<bool> g_capturing{ false };
 static std::mutex g_capMu;
-static std::vector<Sample> g_samples;
+static std::vector<Sample> g_samplesAcc, g_samplesDi;
 static int g_capIndex = 0;
 static double g_capStart = 0;
 
@@ -221,8 +294,9 @@ static LRESULT CALLBACK RawWndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 					if (x || y)
 					{
 						Count(C_RawEvents);
-						g_rawPairX += x; g_rawPairY += y;
-						g_rawRepX += x;  g_rawRepY += y;
+						g_rawPairAccX += x; g_rawPairAccY += y;
+						g_rawPairDiX += x;  g_rawPairDiY += y;
+						g_rawRepX += x;     g_rawRepY += y;
 						if (g_capturing.load()) { g_rawCapX += x; g_rawCapY += y; }
 					}
 				}
@@ -254,19 +328,19 @@ static DWORD WINAPI RawThread(LPVOID)
 	return 0;
 }
 
-// Вызывается из mid-хука на Mouse_GetState: в этот момент аккумуляторы игры ещё не обнулены
+// Вызывается из mid-хука на Mouse_GetState (только если заданы адреса в cfg)
 static void OnMouseGetState()
 {
 	Count(C_MouseGetState);
 	int dx = 0, dy = 0;
-	ReadT(Rebase(cfg::kAccDX), &dx);
-	ReadT(Rebase(cfg::kAccDY), &dy);
-	const LONG rx = g_rawPairX.exchange(0), ry = g_rawPairY.exchange(0);
+	if (g_cfg.accDX) ReadT(Rebase(g_cfg.accDX), &dx);
+	if (g_cfg.accDY) ReadT(Rebase(g_cfg.accDY), &dy);
+	const LONG rx = g_rawPairAccX.exchange(0), ry = g_rawPairAccY.exchange(0);
 	if (!g_capturing.load()) return;
 	Sample s;
 	s.t = NowMs() - g_capStart; s.rx = rx; s.ry = ry; s.gx = dx; s.gy = dy;
 	std::lock_guard<std::mutex> lk(g_capMu);
-	g_samples.push_back(s);
+	g_samplesAcc.push_back(s);
 }
 
 static void StartCapture()
@@ -274,7 +348,8 @@ static void StartCapture()
 	if (g_capturing.load()) return;
 	{
 		std::lock_guard<std::mutex> lk(g_capMu);
-		g_samples.clear();
+		g_samplesAcc.clear();
+		g_samplesDi.clear();
 	}
 	g_rawCapX = 0; g_rawCapY = 0; g_diCapX = 0; g_diCapY = 0;
 	++g_capIndex;
@@ -283,16 +358,11 @@ static void StartCapture()
 	Log("=== CAPTURE %d START ===", g_capIndex);
 }
 
-static void StopCapture()
+static void DumpSamples(const char* label, int idx, const std::vector<Sample>& v)
 {
-	if (!g_capturing.exchange(false)) return;
-	std::vector<Sample> v;
-	{
-		std::lock_guard<std::mutex> lk(g_capMu);
-		v.swap(g_samples);
-	}
-	wchar_t wname[64];
-	swprintf(wname, 64, L"ds3probe_cap_%03d.csv", g_capIndex);
+	if (v.empty()) { Log("  [%s] no samples", label); return; }
+	wchar_t wname[96];
+	swprintf(wname, 96, L"ds3probe_cap_%03d_%hs.csv", idx, label);
 	FILE* f = nullptr;
 	_wfopen_s(&f, MakePath(wname).c_str(), L"wt");
 	double pathRaw = 0, pathGame = 0, netRX = 0, netRY = 0, netGX = 0, netGY = 0;
@@ -305,14 +375,26 @@ static void StopCapture()
 		netRX += s.rx; netRY += s.ry; netGX += s.gx; netGY += s.gy;
 	}
 	if (f) fclose(f);
-	Log("=== CAPTURE %d STOP: %zu frames (Mouse_GetState calls), %.1f s ===", g_capIndex, v.size(), (NowMs() - g_capStart) / 1000.0);
-	Log("  raw (Raw Input, all events while focused): net=(%ld,%ld)", g_rawCapX.load(), g_rawCapY.load());
-	Log("  paired by frame: raw net=(%.0f,%.0f) path=%.0f | game net=(%.0f,%.0f) path=%.0f",
-		netRX, netRY, pathRaw, netGX, netGY, pathGame);
-	if (pathRaw > 0) Log("  game/raw path ratio = %.3f   (смотри не на абсолют, а на зависимость от скорости: analyze_samples.py)", pathGame / pathRaw);
-	Log("  DirectInput mouse sum during capture: (%ld,%ld)", g_diCapX.load(), g_diCapY.load());
-	if (v.empty()) Log("  !!! нет ни одного сэмпла: Mouse_GetState не вызывался (или mid-хук не встал). Смотри секундные сводки.");
-	Log("  csv: %ls", MakePath(wname).c_str());
+	Log("  [%s] %zu samples: raw net=(%.0f,%.0f) path=%.0f | game net=(%.0f,%.0f) path=%.0f | ratio game/raw path=%.3f",
+		label, v.size(), netRX, netRY, pathRaw, netGX, netGY, pathGame, pathRaw > 0 ? pathGame / pathRaw : 0.0);
+	Log("  [%s] csv: %ls", label, MakePath(wname).c_str());
+}
+
+static void StopCapture()
+{
+	if (!g_capturing.exchange(false)) return;
+	std::vector<Sample> acc, di;
+	{
+		std::lock_guard<std::mutex> lk(g_capMu);
+		acc.swap(g_samplesAcc);
+		di.swap(g_samplesDi);
+	}
+	Log("=== CAPTURE %d STOP (%.1f s) ===", g_capIndex, (NowMs() - g_capStart) / 1000.0);
+	Log("  Raw Input total while focused: net=(%ld,%ld)", g_rawCapX.load(), g_rawCapY.load());
+	Log("  DirectInput mouse total: net=(%ld,%ld)", g_diCapX.load(), g_diCapY.load());
+	DumpSamples("di", g_capIndex, di);
+	DumpSamples("acc", g_capIndex, acc);
+	Log("  absolute ratio is not the point (scaling); compare slow vs fast moves: analyze_samples.py <csv>");
 }
 
 // ----------------------------------------------------------------------------
@@ -435,7 +517,17 @@ static HRESULT WINAPI GetState_H(void* self, DWORD cb, void* data)
 		if (SUCCEEDED(hr) && data && (cb == 16 || cb == 20)) // DIMOUSESTATE / DIMOUSESTATE2
 		{
 			const LONG* p = static_cast<const LONG*>(data);
-			if (g_capturing.load()) { g_diCapX += p[0]; g_diCapY += p[1]; }
+			static std::atomic<int> nShown{ 0 };
+			if (nShown.fetch_add(1) < 8) Log("DI mouse state: cb=%u lX=%ld lY=%ld lZ=%ld", (unsigned)cb, p[0], p[1], p[2]);
+			const LONG rx = g_rawPairDiX.exchange(0), ry = g_rawPairDiY.exchange(0);
+			if (g_capturing.load())
+			{
+				g_diCapX += p[0]; g_diCapY += p[1];
+				Sample s;
+				s.t = NowMs() - g_capStart; s.rx = rx; s.ry = ry; s.gx = (int)p[0]; s.gy = (int)p[1];
+				std::lock_guard<std::mutex> lk(g_capMu);
+				g_samplesDi.push_back(s);
+			}
 		}
 	}
 	else Count(C_DI_OtherState);
@@ -444,7 +536,6 @@ static HRESULT WINAPI GetState_H(void* self, DWORD cb, void* data)
 
 static HRESULT WINAPI GetData_H(void* self, DWORD cb, void* rgdod, DWORD* pdw, DWORD flags)
 {
-	const DWORD before = pdw ? *pdw : 0;
 	const HRESULT hr = hkGetData.unsafe_stdcall<HRESULT>(self, cb, rgdod, pdw, flags);
 	if (IsMouseDev(self))
 	{
@@ -463,7 +554,6 @@ static HRESULT WINAPI GetData_H(void* self, DWORD cb, void* rgdod, DWORD* pdw, D
 		}
 	}
 	else Count(C_DI_OtherData);
-	(void)before;
 	return hr;
 }
 
@@ -511,7 +601,7 @@ static HRESULT WINAPI DI8Create_H(HINSTANCE h, DWORD ver, REFIID riid, LPVOID* o
 }
 
 // ----------------------------------------------------------------------------
-// mid-хуки по адресам exe (только счётчики, поведение игры не меняется)
+// mid-хуки по адресам exe: ТОЛЬКО по cfg, с проверкой сборки и (опционально) байтов
 // ----------------------------------------------------------------------------
 static SafetyHookMid mhMouseGetState, mhWndMsg, mhPoll, mhMapper;
 static bool g_exeHooked = false;
@@ -522,35 +612,50 @@ static void DumpBytes(const char* name, uintptr_t ghidraAddr)
 	if (!ReadBytes(Rebase(ghidraAddr), b, sizeof(b))) { Log("  %-18s %08X: UNREADABLE", name, (unsigned)ghidraAddr); return; }
 	char s[64] = {};
 	for (int i = 0; i < 16; ++i) snprintf(s + i * 3, 4, "%02X ", b[i]);
-	Log("  %-18s %08X: %s  <- сверь с листингом Ghidra", name, (unsigned)ghidraAddr, s);
+	Log("  %-18s %08X: %s <- compare with the Ghidra listing of THIS exe version", name, (unsigned)ghidraAddr, s);
+}
+
+static bool FuncReady(const char* name, uintptr_t ghidraAddr, const std::string& bytes)
+{
+	if (!ghidraAddr) return false;
+	DumpBytes(name, ghidraAddr);
+	if (!BytesMatch(Rebase(ghidraAddr), bytes)) { Log("  %s: expected bytes MISMATCH -> hook skipped", name); return false; }
+	if (bytes.empty()) Log("  %s: no .bytes in cfg, hooking WITHOUT verification (a wrong address corrupts code!)", name);
+	return true;
 }
 
 static void InstallExeHooks()
 {
 	g_exeHooked = true;
-	Log("exe base=%08X imageBase(PE)=%08X  (если база != imageBase, адреса пересчитываются автоматически)", (unsigned)g_exeBase, (unsigned)g_imageBase);
-	struct Entry { const char* n; uintptr_t a; };
-	const Entry t[] = {
-		{ "Mouse_GetState",   cfg::kMouseGetState },   { "PollMouseCursor",  cfg::kPollMouseCursor },
-		{ "Mouse_WndMsg",     cfg::kWndMsg },          { "InputMapper_Update", cfg::kInputMapper } };
-	for (const Entry& e : t) DumpBytes(e.n, e.a);
+	if (!g_cfg.loaded) return;
+	if (g_cfg.hasBuild && g_cfg.build != g_timeDateStamp)
+	{
+		Log("cfg Build=%08X != exe TimeDateStamp=%08X -> exe hooks SKIPPED (addresses are for another build)",
+			(unsigned)g_cfg.build, (unsigned)g_timeDateStamp);
+		return;
+	}
+	if (!g_cfg.hasBuild) Log("cfg has no Build line (cannot verify the build); add: Build = %08X", (unsigned)g_timeDateStamp);
 
-	mhMouseGetState = safetyhook::create_mid(reinterpret_cast<void*>(Rebase(cfg::kMouseGetState)),
-		[](safetyhook::Context&) { OnMouseGetState(); });
-	mhPoll = safetyhook::create_mid(reinterpret_cast<void*>(Rebase(cfg::kPollMouseCursor)),
-		[](safetyhook::Context&) { Count(C_PollMouseCursor); });
-	mhMapper = safetyhook::create_mid(reinterpret_cast<void*>(Rebase(cfg::kInputMapper)),
-		[](safetyhook::Context&) { Count(C_InputMapper); });
-	mhWndMsg = safetyhook::create_mid(reinterpret_cast<void*>(Rebase(cfg::kWndMsg)),
-		[](safetyhook::Context& ctx)
-		{
-			// на входе: [esp]=ret, [esp+4]=param_1, [esp+8]=hWnd, [esp+0xC]=msg
-			uint32_t msg = 0;
-			ReadT(static_cast<uintptr_t>(ctx.esp) + 0xC, &msg);
-			Count(C_WndMsgAll);
-			if (msg == 0x200) Count(C_WndMouseMove); // WM_MOUSEMOVE
-		});
-	Log("mid-хуки по адресам exe поставлены (успех не проверяется; если счётчики молчат - сверь байты выше)");
+	if (FuncReady("Mouse_GetState", g_cfg.mouseGetState, g_cfg.bMouseGetState))
+		mhMouseGetState = safetyhook::create_mid(reinterpret_cast<void*>(Rebase(g_cfg.mouseGetState)),
+			[](safetyhook::Context&) { OnMouseGetState(); });
+	if (FuncReady("PollMouseCursor", g_cfg.pollMouseCursor, g_cfg.bPoll))
+		mhPoll = safetyhook::create_mid(reinterpret_cast<void*>(Rebase(g_cfg.pollMouseCursor)),
+			[](safetyhook::Context&) { Count(C_PollMouseCursor); });
+	if (FuncReady("InputMapper_Update", g_cfg.inputMapper, g_cfg.bMapper))
+		mhMapper = safetyhook::create_mid(reinterpret_cast<void*>(Rebase(g_cfg.inputMapper)),
+			[](safetyhook::Context&) { Count(C_InputMapper); });
+	if (FuncReady("Mouse_WndMsg", g_cfg.wndMsg, g_cfg.bWndMsg))
+		mhWndMsg = safetyhook::create_mid(reinterpret_cast<void*>(Rebase(g_cfg.wndMsg)),
+			[](safetyhook::Context& ctx)
+			{
+				// на входе: [esp]=ret, [esp+4]=param_1, [esp+8]=hWnd, [esp+0xC]=msg (раскладка из Ghidra 1.0.0.0, проверь для своей версии)
+				uint32_t msg = 0;
+				ReadT(static_cast<uintptr_t>(ctx.esp) + 0xC, &msg);
+				Count(C_WndMsgAll);
+				if (msg == 0x200) Count(C_WndMouseMove); // WM_MOUSEMOVE
+			});
+	Log("exe hooks done (see lines above for what was installed or skipped)");
 }
 
 // ----------------------------------------------------------------------------
@@ -558,6 +663,7 @@ static void InstallExeHooks()
 // ----------------------------------------------------------------------------
 static void PrintSecond()
 {
+	static int idleSecs = 0;
 	uint64_t d[C_COUNT];
 	bool any = false;
 	for (int i = 0; i < C_COUNT; ++i)
@@ -568,21 +674,36 @@ static void PrintSecond()
 		any = any || d[i] != 0;
 	}
 	const LONG rx = g_rawRepX.exchange(0), ry = g_rawRepY.exchange(0);
-	if (!any) return;
-
-	int ax = 0, ay = 0;
-	uint8_t cap = 0xFF, rc = 0xFF;
-	ReadT(Rebase(cfg::kAccDX), &ax);
-	ReadT(Rebase(cfg::kAccDY), &ay);
-	ReadT(Rebase(cfg::kFlagCaptured), &cap);
-	ReadT(Rebase(cfg::kFlagRecenter), &rc);
+	if (!any)
+	{
+		// сердцебиение: если лог оборвался, а процесс жив - поток пробы пишет "alive", значит завис именно поток игры
+		if (++idleSecs % 5 == 0) Log("alive (no counted events for %d s) fg=%d", idleSecs, (int)GameFocused());
+		return;
+	}
+	idleSecs = 0;
 
 	std::string s;
-	char b[96];
+	char b[128];
 	for (int i = 0; i < C_COUNT; ++i)
 		if (d[i]) { snprintf(b, sizeof(b), "%s=%llu ", kCounterName[i], (unsigned long long)d[i]); s += b; }
-	snprintf(b, sizeof(b), "| raw=(%ld,%ld) acc=(%d,%d) cap=%u rc=%u fg=%d", rx, ry, ax, ay, (unsigned)cap, (unsigned)rc, (int)GameFocused());
+	snprintf(b, sizeof(b), "| raw=(%ld,%ld) fg=%d", rx, ry, (int)GameFocused());
 	s += b;
+	if (g_cfg.accDX && g_cfg.accDY)
+	{
+		int ax = 0, ay = 0;
+		ReadT(Rebase(g_cfg.accDX), &ax);
+		ReadT(Rebase(g_cfg.accDY), &ay);
+		snprintf(b, sizeof(b), " acc=(%d,%d)", ax, ay);
+		s += b;
+	}
+	if (g_cfg.flagCaptured && g_cfg.flagRecenter)
+	{
+		uint8_t cap = 0xFF, rc = 0xFF;
+		ReadT(Rebase(g_cfg.flagCaptured), &cap);
+		ReadT(Rebase(g_cfg.flagRecenter), &rc);
+		snprintf(b, sizeof(b), " cap=%u rc=%u", (unsigned)cap, (unsigned)rc);
+		s += b;
+	}
 	Log("1s: %s", s.c_str());
 }
 
@@ -620,15 +741,15 @@ static DWORD WINAPI WorkerThread(LPVOID)
 		Sleep(10);
 		const double now = NowMs();
 
-		// mid-хуки по адресам exe ставим после загрузки d3d9 (к этому моменту код распакован)
+		// mid-хуки по адресам exe (если есть cfg) ставим не сразу, а через 1.5 с после появления d3d9
 		if (!g_exeHooked)
 		{
-			if (d3d9Seen < 0 && GetModuleHandleW(L"d3d9.dll")) { d3d9Seen = now; Log("d3d9.dll загружен"); }
-			if ((d3d9Seen >= 0 && now - d3d9Seen > 1500.0) || now - t0 > cfg::kWaitD3D9MaxMs) InstallExeHooks();
+			if (d3d9Seen < 0 && GetModuleHandleW(L"d3d9.dll")) { d3d9Seen = now; Log("d3d9.dll is loaded"); }
+			if ((d3d9Seen >= 0 && now - d3d9Seen > 1500.0) || now - t0 > opt::kWaitD3D9MaxMs) InstallExeHooks();
 		}
 
 		const bool fg = GameFocused();
-		const bool n6 = fg && KeyDown(cfg::kVkMarker), n7 = fg && KeyDown(cfg::kVkStart), n8 = fg && KeyDown(cfg::kVkStop);
+		const bool n6 = fg && KeyDown(opt::kVkMarker), n7 = fg && KeyDown(opt::kVkStart), n8 = fg && KeyDown(opt::kVkStop);
 		if (n6 && !k6) { Log("=== MARKER %d ===", ++marker); DumpCallers(); }
 		if (n7 && !k7) StartCapture();
 		if (n8 && !k8) StopCapture();
@@ -654,9 +775,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 		const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(g_exeBase);
 		const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(g_exeBase + dos->e_lfanew);
 		g_imageBase = nt->OptionalHeader.ImageBase;
+		g_timeDateStamp = nt->FileHeader.TimeDateStamp;
+		g_sizeOfImage = nt->OptionalHeader.SizeOfImage;
 
 		OpenLog();
-		Log("DS3Probe attach. pid=%lu", GetCurrentProcessId());
+		Log("DS3Probe v2 attach. pid=%lu exe base=%08X imageBase=%08X PE TimeDateStamp=%08X SizeOfImage=%08X",
+			GetCurrentProcessId(), (unsigned)g_exeBase, (unsigned)g_imageBase, (unsigned)g_timeDateStamp, (unsigned)g_sizeOfImage);
+		LoadConfig();
 
 		// настоящий dinput8.dll из System32 (экспорты-переходники лежат в dllmain.hpp)
 		wchar_t sys[MAX_PATH] = {};
@@ -668,7 +793,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 			hkDI8Create = safetyhook::create_inline(reinterpret_cast<void*>(dinput8.DirectInput8Create), reinterpret_cast<void*>(&DI8Create_H));
 			Log("hook DirectInput8Create: %s", hkDI8Create ? "ok" : "FAILED");
 		}
-		else Log("не удалось загрузить настоящий dinput8.dll!");
+		else Log("could not load the real dinput8.dll!");
 
 		CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
 	}
