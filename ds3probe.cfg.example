@@ -1,0 +1,36 @@
+# ds3probe.cfg - НЕОБЯЗАТЕЛЬНЫЙ файл рядом с deadspace3.exe. Для 1.0.0.1 (MD5 1802f17a2cc1c2797323632862c6fb1f)
+# адреса уже зашиты в DLL по MD5 файла: ничего создавать не нужно.
+#
+# Имя файла: ds3probe_<md5 exe>.cfg (для конкретной сборки) или ds3probe.cfg. Первый найденный читается.
+# Строгий разбор: любая ошибка (опечатка в адресе, неизвестный ключ, строка без '=') = exe-хуки НЕ ставятся,
+# причина пишется в лог. Адреса - в системе координат Ghidra той же сборки exe, hex, до 8 цифр.
+# Хук ставится, только если .bytes заданы (>= 8 байт, >= 5 не-масок) и совпали с памятью.
+#
+# --- защита от чужой сборки (рекомендуется для любого нового cfg) ---
+# MD5 = 1802f17a2cc1c2797323632862c6fb1f
+# Build = XXXXXXXX                      # PE TimeDateStamp из лога (строка "exe MD5=... PE TimeDateStamp=...")
+#
+# --- переопределение адресов (если задан новый адрес, байты профиля сбрасываются - задай и .bytes) ---
+# MouseGetState = 0040A820
+# MouseGetState.bytes = 55 8B EC DB 05 D0 1D 1D 01 8B 45 08
+# PollMouseCursor = 0040CE30
+# PollMouseCursor.bytes = 55 8B EC 83 EC 28 56 8B 35 F4 1D 1D
+# WndMsg = 0040D270
+# WndMsg.bytes = 55 8B EC 8B 45 08 83 EC 28 53 8B 5D
+# InputMapper = 00ACB780
+# InputMapper.bytes = 55 8B EC 83 EC 18 53 56 57 8B 7D 10
+# AccDX = 011D1DD0
+# AccDY = 011D1DD4
+# FlagCaptured = 011D1DCE
+# FlagRecenter = 011D1DEE
+# VirtW = 0133B0A8                      # рабочие имена g_virtW/H, только для строки условий в логе
+# VirtH = 0133B0AC
+# MgrPtr = 011D1914                     # указатель на менеджер устройств ввода (самопроверка смещений)
+#
+# --- параметры ---
+# ExeHooks = 1          # 0 = только user32/DirectInput/RawInput, без хуков в exe
+# Anchor = 1            # сверка с экспортом ?Init@Mouse@Windows@EARS@@YAXXZ
+# Beeps = 1             # звуки на F7/F8/F9
+# RawScale = 1.0        # множитель режима RAW: подбери так, чтобы чувствительность в RAW совпала с PASS (см. итог захвата: game/raw)
+# OffSens = 17C         # смещение множителя мыши в объекте InputMapper (this = ecx)
+# OffMouseState = 18C   # смещение указателя на MouseState
