@@ -48,6 +48,7 @@
 //  9. Звук: F7 - 1 писк, F8 - 2 писка, F9 - 1/2/3 писка (PASS/RAW/ZERO), ошибка - низкий тон.
 //
 // Хоткеи (работают, только когда окно игры в фокусе):
+//   F5 - (v4.2) метка "вижу рикошёт сейчас" в захвате
 //   F6 - маркер + таблица "кто вызывает user32"    F7/F8 - начало/конец захвата (CSV + итоги в лог)
 //   F9 - режим (см. B выше)                        F10   - условия опыта + список зарегистрированных raw-устройств
 //   F11 - "открыть клэмп" FUN_0040D820 вкл/выкл
@@ -88,10 +89,11 @@
 #ifndef DS3PROBE_GIT_SHA
 #define DS3PROBE_GIT_SHA "unknown"
 #endif
-#define DS3PROBE_VERSION "v4.1"
+#define DS3PROBE_VERSION "v4.2"
 
 namespace opt
 {
+	constexpr int kVkBounce = VK_F5;   // v4.2: "вижу рикошёт прямо сейчас" - метка времени в захвате
 	constexpr int kVkMarker = VK_F6;
 	constexpr int kVkStart  = VK_F7;
 	constexpr int kVkStop   = VK_F8;
@@ -99,6 +101,8 @@ namespace opt
 	constexpr int kVkInfo   = VK_F10;
 	constexpr int kVkOpen   = VK_F11;
 	constexpr int kMaxTracers = 8;         // Trace1..Trace8 в cfg
+	constexpr size_t kMaxDumpRecs = 60000; // потолок записей дампа памяти за захват (каждая до kMaxDumpBytes)
+	constexpr size_t kMaxDumpBytes = 0x400;
 	constexpr size_t kMaxRecs = 400000;    // потолок записей на один CSV стик/трассировщика за захват (защита памяти)
 	constexpr int kMaxFirstLogs = 12;      // сколько первых вызовов каждого API писать подробно
 	constexpr int kWaitD3D9MaxMs = 30000;  // задержка перед mid-хуками exe: ждём d3d9 (+1.5 с)
@@ -326,7 +330,8 @@ static const Profile kProfiles[] =
 
 struct CfgAddr  { bool set = false; uintptr_t v = 0; };
 struct CfgBytes { bool set = false; std::string v; };
-struct TraceCfg { CfgAddr addr; CfgBytes bytes; std::string name; int args = 6; int thisDwords = 8; int base = 0; std::vector<uint32_t> fields; };
+struct TraceCfg { CfgAddr addr; CfgBytes bytes; std::string name; int args = 6; int thisDwords = 8; int base = 0; std::vector<uint32_t> fields;
+	int dumpOff = 0; int dumpLen = 0; int dumpFrom = 0; }; // v4.2: dump = смещение (hex, может быть со знаком) и длина в байтах; dumpfrom = номер трассировщика, чей base брать за указатель (0 = свой)
 struct Config
 {
 	std::wstring file;           // какой файл прочитан
@@ -421,6 +426,27 @@ static bool ParseOffsets(const std::string& v, std::vector<uint32_t>* out)
 	}
 	if (!flush()) return false;
 	return !out->empty();
+}
+// v4.2: "-20 300" -> off=-0x20, len=0x300 (len кратна 4, 4..0x400)
+static bool ParseDumpSpec(const std::string& v, int* off, int* len)
+{
+	std::vector<std::string> t;
+	std::string cur;
+	for (char c : v)
+	{
+		if (c == ' ' || c == ',' || c == '\t') { if (!cur.empty()) { t.push_back(cur); cur.clear(); } }
+		else cur += c;
+	}
+	if (!cur.empty()) t.push_back(cur);
+	if (t.size() != 2) return false;
+	bool neg = false;
+	std::string a = t[0];
+	if (!a.empty() && a[0] == '-') { neg = true; a.erase(0, 1); }
+	uintptr_t o = 0, l = 0;
+	if (!ParseHex32(a, &o) || o >= 0x10000 || !ParseHex32(t[1], &l) || l == 0 || l > opt::kMaxDumpBytes || (l & 3)) return false;
+	*off = neg ? -(int)o : (int)o;
+	*len = (int)l;
+	return true;
 }
 
 // "trace3" / "trace3.bytes" / "trace3.name" ... -> индекс 0..kMaxTracers-1 и суффикс после точки (может быть пустым)
@@ -568,7 +594,14 @@ static void LoadConfig()
 				std::vector<uint32_t> f;
 				if (ParseOffsets(v, &f)) g_cfg.trace[ti].fields = f; else CfgErr(ln, k, "expected up to 16 hex offsets (each < 0x10000), separated by spaces or commas");
 			}
-			else CfgErr(ln, k, "unknown trace sub-key (bytes|name|args|this|base|fields)");
+			else if (sub == "dump")
+			{
+				int off = 0, len = 0;
+				if (ParseDumpSpec(v, &off, &len)) { g_cfg.trace[ti].dumpOff = off; g_cfg.trace[ti].dumpLen = len; }
+				else CfgErr(ln, k, "expected '<offset hex, optional minus> <length hex, multiple of 4, <= 400>', e.g. -20 300");
+			}
+			else if (sub == "dumpfrom") { int n = 0; if (ParseInt(v, 0, opt::kMaxTracers, &n)) g_cfg.trace[ti].dumpFrom = n; else CfgErr(ln, k, "expected 0..8 (number of the tracer whose base register is the pointer; 0 = own)"); }
+			else CfgErr(ln, k, "unknown trace sub-key (bytes|name|args|this|base|fields|dump|dumpfrom)");
 		}
 	}
 	Log("cfg: parsed, %d error(s)%s", g_cfg.errors, g_cfg.errors ? " -> exe hooks will NOT be installed until the cfg is fixed" : "");
@@ -757,12 +790,15 @@ static std::unordered_map<uintptr_t, float> g_clampOrig;      // исходны�
 // ----------------------------------------------------------------------------
 struct VRec { double t; uint32_t arg0, id; uint8_t active; float x, y, accx, accy; };
 struct SRec { double t; float dt, xin, yin, xout, yout; uint32_t id; float win, blend, clamp; uint8_t active; float w[8]; uint32_t ret; uint32_t caller; };
+struct DumpRec { double t; uint8_t id; uint32_t ptr; uint32_t w[opt::kMaxDumpBytes / 4]; };
 struct TraceRec { double t; uint8_t id; uint32_t ecx, edx, ra, eax, bv; uint32_t a[8]; uint32_t th[16]; uint32_t f[16]; };
 
 static std::mutex g_stickMu;
 static std::vector<VRec> g_recV;
 static std::vector<SRec> g_recS;
 static std::vector<TraceRec> g_recT;
+static std::vector<DumpRec> g_recD;      // v4.2: дампы памяти объекта камеры
+static std::vector<double> g_marks;      // v4.2: F5 - моменты "вижу рикошёт" (мс от начала захвата)
 // v4.1: F11 - лестница клэмпа this[3] FUN_0040D820: 0 = исходное значение (2.0), 1..4 = ступени kClampLadder (последняя = практически без клэмпа)
 static std::atomic<int> g_openClamp{ 0 };
 static const float kClampLadder[] = { 6.0f, 12.0f, 24.0f, 1.0e9f };
@@ -872,6 +908,8 @@ struct TraceState
 	int args = 6, thisDw = 8;
 	int base = 0;                    // регистр, по которому читаются .this и .fields (0 = ecx)
 	std::vector<uint32_t> fields;    // смещения от base (dword), до 16
+	int dumpOff = 0, dumpLen = 0, dumpFrom = 0; // v4.2: дамп памяти объекта (см. TraceCfg)
+	std::atomic<uint32_t> lastBase{ 0 };         // последнее значение base-регистра (чтобы другие трассировщики брали его как указатель)
 	std::atomic<uint64_t> calls{ 0 };
 };
 static TraceState g_trace[opt::kMaxTracers];
@@ -898,6 +936,7 @@ static void OnTrace(int id, safetyhook::Context& ctx)
 	const uint64_t n = ts.calls.fetch_add(1, std::memory_order_relaxed) + 1;
 	const uint32_t ecx = (uint32_t)ctx.ecx, edx = (uint32_t)ctx.edx, esp = (uint32_t)ctx.esp, eax = (uint32_t)ctx.eax;
 	const uint32_t bv = CtxReg(ctx, ts.base);
+	ts.lastBase.store(bv, std::memory_order_relaxed);
 	uint32_t ra = 0, a[8] = {}, th[16] = {}, fv[16] = {};
 	ReadT(esp, &ra); // на входе функции это адрес возврата; для хука посреди функции - просто dword на вершине стека
 	if (ts.args > 0) ReadBytes(esp + 4, a, sizeof(uint32_t) * (size_t)ts.args);
@@ -924,6 +963,21 @@ static void OnTrace(int id, safetyhook::Context& ctx)
 		}
 	}
 	if (!g_capturing.load()) return;
+	if (ts.dumpLen > 0)
+	{
+		const uint32_t src = ts.dumpFrom > 0 ? g_trace[ts.dumpFrom - 1].lastBase.load(std::memory_order_relaxed) : bv;
+		const uint32_t ptr = src + (uint32_t)ts.dumpOff;
+		if (PlausiblePtr(src))
+		{
+			DumpRec d = {};
+			d.t = NowMs() - g_capStart; d.id = (uint8_t)id; d.ptr = ptr;
+			if (ReadBytes(ptr, d.w, (size_t)ts.dumpLen))
+			{
+				std::lock_guard<std::mutex> lk(g_stickMu);
+				if (g_recD.size() < opt::kMaxDumpRecs) g_recD.push_back(d);
+			}
+		}
+	}
 	TraceRec r = {};
 	r.t = NowMs() - g_capStart; r.id = (uint8_t)id; r.ecx = ecx; r.edx = edx; r.ra = ra; r.eax = eax; r.bv = bv;
 	memcpy(r.a, a, sizeof(a)); memcpy(r.th, th, sizeof(th)); memcpy(r.f, fv, sizeof(fv));
@@ -1240,7 +1294,7 @@ static void StartCapture()
 	}
 	{
 		std::lock_guard<std::mutex> lk(g_stickMu);
-		g_recV.clear(); g_recS.clear(); g_recT.clear();
+		g_recV.clear(); g_recS.clear(); g_recT.clear(); g_recD.clear(); g_marks.clear();
 	}
 	g_capRawStart = g_rawTotal.load();
 	for (TraceState& t : g_trace) t.calls.store(0);
@@ -1265,6 +1319,12 @@ static void StartCapture()
 		if (g_trace[i].on) { {
 			snprintf(b, sizeof(b), "# trace%d name=%s addr=%08X args=%d this_dwords=%d base=%s fields=", i + 1, g_trace[i].name.c_str(), (unsigned)g_trace[i].addr, g_trace[i].args, g_trace[i].thisDw, kRegNames[g_trace[i].base]); g_capMeta += b;
 			for (size_t q = 0; q < g_trace[i].fields.size(); ++q) { snprintf(b, sizeof(b), "%s%X", q ? " " : "", (unsigned)g_trace[i].fields[q]); g_capMeta += b; }
+			if (g_trace[i].dumpLen > 0)
+			{
+				const int o = g_trace[i].dumpOff;
+				snprintf(b, sizeof(b), " dump=%s%X,%X dumpfrom=%d", o < 0 ? "-" : "", (unsigned)(o < 0 ? -o : o), (unsigned)g_trace[i].dumpLen, g_trace[i].dumpFrom);
+				g_capMeta += b;
+			}
 			g_capMeta += "\n";
 		} }
 	g_capMeta += "# conditions: " + cond + "\n";
@@ -1446,6 +1506,47 @@ static void DumpStick(int idx, const std::vector<VRec>& rv, const std::vector<SR
 	}
 }
 
+// v4.2: дампы памяти объекта камеры (_dump.csv) и метки F5 (_marks.csv)
+static void DumpExtra(int idx, const std::vector<DumpRec>& rd, const std::vector<double>& marks)
+{
+	wchar_t wname[96];
+	if (!rd.empty())
+	{
+		swprintf(wname, 96, L"ds3probe_cap_%03d_dump.csv", idx);
+		FILE* f = nullptr;
+		_wfopen_s(&f, SessionPath(wname).c_str(), L"wt");
+		if (f)
+		{
+			fputs(g_capMeta.c_str(), f); fputs(g_capMetaTail.c_str(), f);
+			// длина дампа по каждому id задана в шапке (dump=OFF,LEN); число слов в строке - по трассировщику
+			fputs("t_ms,id,ptr,words...\n", f);
+			for (const DumpRec& r : rd)
+			{
+				fprintf(f, "%.3f,%u,%08X", r.t, (unsigned)r.id + 1, (unsigned)r.ptr);
+				const int n = g_trace[r.id].dumpLen / 4;
+				for (int i = 0; i < n; ++i) fprintf(f, ",%08X", (unsigned)r.w[i]);
+				fputc('\n', f);
+			}
+			fclose(f);
+		}
+		Log("  [dump] %zu memory dumps written", rd.size());
+	}
+	if (!marks.empty())
+	{
+		swprintf(wname, 96, L"ds3probe_cap_%03d_marks.csv", idx);
+		FILE* f = nullptr;
+		_wfopen_s(&f, SessionPath(wname).c_str(), L"wt");
+		if (f)
+		{
+			fputs(g_capMeta.c_str(), f); fputs(g_capMetaTail.c_str(), f);
+			fputs("t_ms,n\n", f);
+			for (size_t i = 0; i < marks.size(); ++i) fprintf(f, "%.3f,%zu\n", marks[i], i + 1);
+			fclose(f);
+		}
+		Log("  [marks] %zu F5 bounce marks written", marks.size());
+	}
+}
+
 static void StopCapture()
 {
 	if (!g_capturing.exchange(false)) return;
@@ -1458,9 +1559,11 @@ static void StopCapture()
 	std::vector<VRec> rv;
 	std::vector<SRec> rs;
 	std::vector<TraceRec> rt;
+	std::vector<DumpRec> rdump;
+	std::vector<double> rmarks;
 	{
 		std::lock_guard<std::mutex> lk(g_stickMu);
-		rv.swap(g_recV); rs.swap(g_recS); rt.swap(g_recT);
+		rv.swap(g_recV); rs.swap(g_recS); rt.swap(g_recT); rdump.swap(g_recD); rmarks.swap(g_marks);
 	}
 	// жив ли эталон Raw Input: события были в окне захвата и последнее не старше 2 с
 	{
@@ -1480,6 +1583,7 @@ static void StopCapture()
 	DumpAcc(g_capIndex, acc);
 	DumpDi(g_capIndex, di);
 	DumpStick(g_capIndex, rv, rs, rt);
+	DumpExtra(g_capIndex, rdump, rmarks);
 	Log("  next: python analyze_samples.py <session folder>\\ds3probe_cap_%03d_acc.csv", g_capIndex);
 	Tone(2, 1200);
 }
@@ -1884,6 +1988,7 @@ static void InstallExeHooks()
 		{
 			TraceState& ts = g_trace[i];
 			ts.on = true; ts.name = tc.name.empty() ? std::string(nm) : tc.name; ts.addr = tc.addr.v; ts.args = tc.args; ts.thisDw = tc.thisDwords; ts.base = tc.base; ts.fields = tc.fields;
+			ts.dumpOff = tc.dumpOff; ts.dumpLen = tc.dumpLen; ts.dumpFrom = tc.dumpFrom;
 			++g_traceOn;
 		}
 		Log("  %s (%s) hook: %s", nm, tc.name.empty() ? "-" : tc.name.c_str(), g_traceHooks[i] ? "ok" : "FAILED");
@@ -2028,7 +2133,7 @@ static DWORD WINAPI WorkerThread(LPVOID)
 
 	const double t0 = NowMs();
 	double nextSec = t0 + 1000.0, d3d9Seen = -1.0;
-	bool k6 = false, k7 = false, k8 = false, k9 = false, k10 = false, k11 = false;
+	bool k5 = false, k6 = false, k7 = false, k8 = false, k9 = false, k10 = false, k11 = false;
 	int marker = 0;
 
 	for (;;)
@@ -2046,15 +2151,27 @@ static DWORD WINAPI WorkerThread(LPVOID)
 		if (g_mode.load() != M_PASS && now - g_modeSince.load() > opt::kModeAutoRevertMs) { SetMode(M_PASS, "auto-revert after 2 min"); Tone(1, 300); }
 
 		const bool fg = GameFocused();
+		const bool n5 = fg && KeyDown(opt::kVkBounce);
 		const bool n6 = fg && KeyDown(opt::kVkMarker), n7 = fg && KeyDown(opt::kVkStart), n8 = fg && KeyDown(opt::kVkStop);
 		const bool n9 = fg && KeyDown(opt::kVkMode), n10 = fg && KeyDown(opt::kVkInfo), n11 = fg && KeyDown(opt::kVkOpen);
+		if (n5 && !k5)
+		{
+			if (g_capturing.load())
+			{
+				const double tm = NowMs() - g_capStart;
+				{ std::lock_guard<std::mutex> lk(g_stickMu); g_marks.push_back(tm); }
+				Log("=== BOUNCE MARK at %.0f ms ===", tm);
+			}
+			else Log("F5: bounce mark ignored (no capture running; F7 starts one)");
+			Tone(1, 1800);
+		}
 		if (n6 && !k6) { Log("=== MARKER %d ===", ++marker); DumpCallers(); g_diDumpCallers = true; }
 		if (n7 && !k7) StartCapture();
 		if (n8 && !k8) StopCapture();
 		if (n9 && !k9) CycleMode();
 		if (n10 && !k10) { LogConditions("F10"); LogRegisteredRaw("F10"); }
 		if (n11 && !k11) ToggleOpenClamp();
-		k6 = n6; k7 = n7; k8 = n8; k9 = n9; k10 = n10; k11 = n11;
+		k5 = n5; k6 = n6; k7 = n7; k8 = n8; k9 = n9; k10 = n10; k11 = n11;
 
 		if (now >= nextSec) { nextSec += 1000.0; PrintSecond(); }
 	}

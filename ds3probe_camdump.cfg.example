@@ -1,0 +1,57 @@
+# DS3Probe v4.2 - cfg для опыта "где рикошёт": дампы памяти объекта камеры + знакомые трассировщики.
+# Положи рядом с deadspace3.exe под именем ds3probe.cfg (старый cfg сохрани под другим именем).
+# Байты взяты из Приложения A отчёта (база Ghidra 1.0.0.1).
+MD5 = 1802f17a2cc1c2797323632862c6fb1f
+Build = 511E9327
+
+# применение дельты поворота: a0 = dPitch, a1 = dYaw (вызывается и из LookUpdate, и из прицельной ветки)
+Trace1 = 00721BD0
+Trace1.bytes = 53 8B DC 83 EC 08 83 E4 F0 83 C4 04
+Trace1.name = ApplyRotDelta
+Trace1.args = 6
+Trace1.this = 3
+
+# основное обновление взгляда (обычная камера). Дамп 0x300 байт самого объекта-контроллера.
+Trace2 = 0073F310
+Trace2.bytes = 53 8B DC 83 EC 08 83 E4 F0 83 C4 04
+Trace2.name = LookUpdate
+Trace2.args = 2
+Trace2.this = 0
+Trace2.fields = 70 150 158 C8 CC D0 D4 D8 74 7C 90 134 138 164 1D0 618
+Trace2.dump = 0 300
+
+# после CALL OwnerCheck в LookUpdate: a4 = тангаж, a5 = рыскание локальной копии (как в прошлых захватах)
+Trace3 = 0073FA33
+Trace3.bytes = 84 C0 74 31 39 75 D0 75 2C 8B 7D B4
+Trace3.name = OwnerCheckRet
+Trace3.args = 6
+Trace3.this = 0
+
+# SetTransform: вызывается раз в кадр обычной камеры уже после фиксации. Дамп объекта камеры
+# (указатель = edi из Trace8 = cam+0x20, поэтому смещение -20 даёт начало объекта камеры).
+Trace4 = 0073CEB0
+Trace4.bytes = 55 8B EC 8B 45 08 D9 EE 0F 28 00
+Trace4.name = SetTransform
+Trace4.args = 4
+Trace4.this = 4
+Trace4.dumpfrom = 8
+Trace4.dump = -20 300
+
+# следящая камера: вызывается и в прицеле. Дамп того же объекта камеры.
+Trace5 = 0074BAA0
+Trace5.bytes = 53 8B DC 83 EC 08 83 E4 F0 83 C4 04
+Trace5.name = CamFollow
+Trace5.args = 4
+Trace5.this = 0
+Trace5.fields = 70 170 174 178 1A0 1A4 1A8 1B4 1B8 1BC
+Trace5.dumpfrom = 8
+Trace5.dump = -20 300
+
+# фиксация поворота (запись L -> cam+0x20): edi = cam+0x20. Дамп ДО записи; задаёт указатель камеры для Trace4/5.
+Trace8 = 0073FA3F
+Trace8.bytes = B9 28 00 00 00 8D B5 D0 FE FF FF
+Trace8.name = CommitExec
+Trace8.args = 2
+Trace8.base = edi
+Trace8.this = 3
+Trace8.dump = -20 300
