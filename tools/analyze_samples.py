@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+УСТАРЕЛ для данных v4: эталон Raw Input в v3 умирал через ~1 с (raw_dx = 0), поэтому вердикты уровня 1 и режим RAW ненадёжны.
+Для захватов DS3Probe v4 используй analyze_di.py (DI как эталон, режимы DI-ZERO/xK, конвейер "стик").
+Файл оставлен для старых CSV и для тестов tests/test_analyze.py.
+
 analyze_samples.py v3 - разбор ds3probe_cap_NNN_acc.csv (DS3Probe v3).
 
 Колонки CSV (шапка из строк '# ...' пропускается, из неё берутся client=WxH и half=):

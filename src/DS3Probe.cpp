@@ -1,6 +1,28 @@
 // ============================================================================
-// DS3Probe v3 - прокси dinput8.dll для Dead Space 3. Ничего не чинит: собирает данные и (по F9)
-// подменяет вход игры, чтобы локализовать причину "отрицательного ускорения".
+// DS3Probe v4 - прокси dinput8.dll для Dead Space 3. Ничего не чинит: собирает данные и (по F9/F11)
+// подменяет вход игры, чтобы локализовать причину "отрицательного ускорения" (потолка скорости камеры).
+//
+// ЧТО НОВОГО В v4 (по результатам сессии 20261007_194254; подробности - claude/ds3_status.md):
+//  A. Факты прошлого опыта: (1) эталон Raw Input умер через ~1 с (DirectInput перерегистрировал мышь процесса);
+//     (2) камера крутилась при acc:=0 и look:=0, т.е. НЕ из аккумулятора Mouse_GetState и не из MouseState.look;
+//     (3) игра читает DI-мышь (DIMOUSESTATE2) каждый кадр, и её счёты == аккумулятор в ~98% кадров.
+//  B. Режимы F9 теперь работают на DirectInput-входе (то, что читает игра для камеры):
+//        PASS -> DI-ZERO -> DI-xA(0.5) -> DI-xB(0.25) -> DI-xC(2.0) -> ACC-ZERO -> PASS
+//     DI-ZERO: lX/lY := 0 (камера обязана замереть, если она питается от DI). DI-xK: счёты умножаются на K
+//     (с дробным остатком): если потолок внутри игры, он сдвигается пропорционально K. RAW убран: эталон мёртв.
+//  C. Хуки конвейера "стик" (оба проверяются по байтам; соглашения вызова взяты из декомпиляции Ghidra):
+//        FUN_0040E680 (__thiscall, "мышь как виртуальный стик", круговой клэмп до длины 1.0)
+//        FUN_0040D820 (__thiscall, сглаживание по окну времени + клэмп +-this[3])
+//     Логируют входы/выходы/поля this в ds3probe_cap_NNN_stickv.csv / _sticks.csv. F11 = "открыть клэмп"
+//     (this[3] := 1e9 в FUN_0040D820 на каждом вызове): если потолок исчез - причина найдена.
+//  D. Трассировщики Trace1..Trace8 из cfg: хук на ВХОДЕ любой функции (адрес + байты), лог ecx/edx/аргументов
+//     стека/полей this в ds3probe_cap_NNN_trace.csv. Нужны, чтобы проверять новые гипотезы из Ghidra без пересборки.
+//  E. user32!RegisterRawInputDevices: лог каждого вызова (кто, какие флаги/окно); раз в секунду (первые 12 с,
+//     потом реже) GetRegisteredRawInputDevices - чья регистрация сейчас действует. НИКОГДА не перерегистрируем
+//     мышь сами: это сломало бы DirectInput игры.
+//  F. В шапке CSV: raw_reference=alive/DEAD; _di.csv дополнен режимом и значениями после подмены.
+//
+// Остальное описание - как в v3:
 //
 // Что нового относительно v2 (все пункты - из аудита 2026-10-07, раздел 6):
 //  1. Профиль сборки по MD5 exe зашит в DLL (сейчас 1.0.0.1): cfg для неё НЕ нужен. cfg ищется как
@@ -27,7 +49,8 @@
 //
 // Хоткеи (работают, только когда окно игры в фокусе):
 //   F6 - маркер + таблица "кто вызывает user32"    F7/F8 - начало/конец захвата (CSV + итоги в лог)
-//   F9 - режим PASS/RAW/ZERO                       F10   - записать условия опыта в лог
+//   F9 - режим (см. B выше)                        F10   - условия опыта + список зарегистрированных raw-устройств
+//   F11 - "открыть клэмп" FUN_0040D820 вкл/выкл
 //
 // Сборка: GitHub Actions (см. CMakeLists.txt и .github/workflows/build.yml). MSVC, Win32, статический CRT.
 // ВНИМАНИЕ: автор не мог собрать этот файл (в его среде нет Windows-тулчейна); проверен только разбор
@@ -40,6 +63,7 @@
 #include <intrin.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <cmath>
@@ -64,7 +88,7 @@
 #ifndef DS3PROBE_GIT_SHA
 #define DS3PROBE_GIT_SHA "unknown"
 #endif
-#define DS3PROBE_VERSION "v3"
+#define DS3PROBE_VERSION "v4"
 
 namespace opt
 {
@@ -73,6 +97,9 @@ namespace opt
 	constexpr int kVkStop   = VK_F8;
 	constexpr int kVkMode   = VK_F9;
 	constexpr int kVkInfo   = VK_F10;
+	constexpr int kVkOpen   = VK_F11;
+	constexpr int kMaxTracers = 8;         // Trace1..Trace8 в cfg
+	constexpr size_t kMaxRecs = 400000;    // потолок записей на один CSV стик/трассировщика за захват (защита памяти)
 	constexpr int kMaxFirstLogs = 12;      // сколько первых вызовов каждого API писать подробно
 	constexpr int kWaitD3D9MaxMs = 30000;  // задержка перед mid-хуками exe: ждём d3d9 (+1.5 с)
 	constexpr int kMapperGiveUp = 240;     // столько вызовов InputMapper без единого правдоподобного MouseState -> отключить
@@ -186,6 +213,8 @@ static std::string Where(const void* addr)
 	{
 		if (reinterpret_cast<uintptr_t>(m) == g_exeBase)
 			snprintf(buf, sizeof(buf), "exe+0x%X [ghidra %08X]", (unsigned)(a - g_exeBase), (unsigned)(a - g_exeBase + g_imageBase));
+		else if (m == g_self)
+			snprintf(buf, sizeof(buf), "DS3Probe(proxy dinput8.dll)+0x%X", (unsigned)(a - reinterpret_cast<uintptr_t>(m)));
 		else
 		{
 			wchar_t name[MAX_PATH] = {};
@@ -262,6 +291,8 @@ struct Resolved
 	uintptr_t accDX = 0, accDY = 0, flagCap = 0, flagRc = 0;         // данные
 	uintptr_t virtW = 0, virtH = 0;                                  // g_virtW/H (рабочие имена; только для лога)
 	uintptr_t mgrPtr = 0;                                            // указатель на менеджер устройств (DAT_011ac914 в 1.0.0.0)
+	uintptr_t stickVirt = 0, stickSmooth = 0;                        // FUN_0040E680 / FUN_0040D820 (конвейер "стик")
+	std::string bStickVirt, bStickSmooth;
 	const char* profile = "none";
 };
 
@@ -279,6 +310,11 @@ static Resolved MakeProfile1001()
 	r.flagCap = 0x011D1DCE; r.flagRc = 0x011D1DEE;
 	r.virtW = 0x0133B0A8;  r.virtH = 0x0133B0AC;
 	r.mgrPtr = 0x011D1914;
+	// Конвейер "стик" (декомпиляция Ghidra, 1.0.0.1): обе функции __thiscall, callee cleans 0xC.
+	// Байты прологов в отчёте не напечатаны, поэтому пролог в маске "??"; опора - mov ecx,[011D1914] (8B 0D ..) и
+	// mov al,[ecx+574h] (8A 81 74 05 00 00), их смещения от начала функции взяты из отчёта (0040E687/0040E68D, 0040D82C/0040D832).
+	r.stickVirt   = 0x0040E680; r.bStickVirt   = "?? ?? ?? ?? ?? ?? ?? 8B 0D 14 19 1D 01 8A 81 74 05 00 00";
+	r.stickSmooth = 0x0040D820; r.bStickSmooth = "?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 8B 0D 14 19 1D 01 8A 81 74 05 00 00";
 	return r;
 }
 
@@ -290,16 +326,19 @@ static const Profile kProfiles[] =
 
 struct CfgAddr  { bool set = false; uintptr_t v = 0; };
 struct CfgBytes { bool set = false; std::string v; };
+struct TraceCfg { CfgAddr addr; CfgBytes bytes; std::string name; int args = 6; int thisDwords = 8; };
 struct Config
 {
 	std::wstring file;           // какой файл прочитан
 	int errors = 0;
 	bool hasBuild = false; uint32_t build = 0; std::string md5;
-	bool exeHooks = true, anchor = true, beeps = true;
-	double rawScale = 1.0;
+	bool exeHooks = true, anchor = true, beeps = true, stickHooks = true;
+	double rawScale = 1.0;                       // не используется с v4 (RAW убран), ключ принимается для совместимости
+	double diScale[3] = { 0.5, 0.25, 2.0 };      // множители режимов DI-xA / DI-xB / DI-xC
+	TraceCfg trace[opt::kMaxTracers];
 	uintptr_t offSens = 0x17C, offMouseState = 0x18C;
-	CfgAddr mgs, poll, wnd, mapper, accDX, accDY, flagCap, flagRc, virtW, virtH, mgrPtr;
-	CfgBytes bMgs, bPoll, bWnd, bMapper;
+	CfgAddr mgs, poll, wnd, mapper, accDX, accDY, flagCap, flagRc, virtW, virtH, mgrPtr, stickVirt, stickSmooth;
+	CfgBytes bMgs, bPoll, bWnd, bMapper, bStickVirt, bStickSmooth;
 };
 static Config g_cfg;
 static Resolved g_r;
@@ -345,6 +384,29 @@ static bool ParseDouble(const std::string& s, double* out)
 	*out = d;
 	return true;
 }
+static bool ParseInt(const std::string& s, int lo, int hi, int* out)
+{
+	char* end = nullptr;
+	const long v = strtol(s.c_str(), &end, 10);
+	if (end == s.c_str() || *end != '\0' || v < lo || v > hi) return false;
+	*out = (int)v;
+	return true;
+}
+// "trace3" / "trace3.bytes" / "trace3.name" ... -> индекс 0..kMaxTracers-1 и суффикс после точки (может быть пустым)
+static bool ParseTraceKey(const std::string& k, int* idx, std::string* sub)
+{
+	if (k.size() < 6 || k.compare(0, 5, "trace") != 0) return false;
+	size_t i = 5;
+	int n = 0;
+	bool any = false;
+	while (i < k.size() && k[i] >= '0' && k[i] <= '9') { n = n * 10 + (k[i] - '0'); ++i; any = true; if (n > 99) return false; }
+	if (!any || n < 1 || n > opt::kMaxTracers) return false;
+	if (i == k.size()) sub->clear();
+	else if (k[i] == '.') *sub = k.substr(i + 1);
+	else return false;
+	*idx = n - 1;
+	return true;
+}
 // "55 8B EC ?? 8B" -> {0x55,0x8B,0xEC,-1,0x8B}; строго по два hex-знака или ?/??
 static bool ParsePattern(const std::string& s, std::vector<int>& pat)
 {
@@ -384,7 +446,11 @@ static void CfgErr(int line, const std::string& key, const char* why)
 //   MD5 = <32 hex>     Build = <TimeDateStamp hex>   (необязательно; при несовпадении exe-хуки не ставятся)
 //   MouseGetState / PollMouseCursor / WndMsg / InputMapper = адрес НАЧАЛА функции;   <имя>.bytes = байты (?? - любой)
 //   AccDX AccDY FlagCaptured FlagRecenter VirtW VirtH MgrPtr = адреса данных
-//   ExeHooks = 0/1   Anchor = 0/1   Beeps = 0/1   RawScale = 1.0   OffSens = 17C   OffMouseState = 18C
+//   StickVirt / StickSmooth (+ .bytes) = адреса FUN_0040E680 / FUN_0040D820;  StickHooks = 0/1
+//   DiScaleA / DiScaleB / DiScaleC = множители режимов F9 (по умолчанию 0.5 / 0.25 / 2.0)
+//   Trace1..Trace8 = адрес функции для трассировки на входе; Trace1.bytes = байты (обязательны);
+//     Trace1.name = подпись; Trace1.args = сколько dword стека снимать (0..8, умолч. 6); Trace1.this = сколько dword по ecx (0..16, умолч. 8)
+//   ExeHooks = 0/1   Anchor = 0/1   Beeps = 0/1   OffSens = 17C   OffMouseState = 18C
 static void LoadConfig()
 {
 	std::string text;
@@ -427,6 +493,17 @@ static void LoadConfig()
 		else if (k == "pollmousecursor.bytes") bytes(g_cfg.bPoll);
 		else if (k == "wndmsg.bytes") bytes(g_cfg.bWnd);
 		else if (k == "inputmapper.bytes") bytes(g_cfg.bMapper);
+		else if (k == "stickvirt") addr(g_cfg.stickVirt);
+		else if (k == "sticksmooth") addr(g_cfg.stickSmooth);
+		else if (k == "stickvirt.bytes") bytes(g_cfg.bStickVirt);
+		else if (k == "sticksmooth.bytes") bytes(g_cfg.bStickSmooth);
+		else if (k == "stickhooks") flag(g_cfg.stickHooks);
+		else if (k == "discalea" || k == "discaleb" || k == "discalec")
+		{
+			double d = 0;
+			if (ParseDouble(v, &d) && d > 0.0 && d < 100.0) g_cfg.diScale[k[7] - 'a'] = d;
+			else CfgErr(ln, k, "expected a number in (0,100)");
+		}
 		else if (k == "accdx") addr(g_cfg.accDX);
 		else if (k == "accdy") addr(g_cfg.accDY);
 		else if (k == "flagcaptured") addr(g_cfg.flagCap);
@@ -440,7 +517,18 @@ static void LoadConfig()
 		else if (k == "rawscale") { double d = 0; if (ParseDouble(v, &d) && d > 0.0 && d < 100.0) g_cfg.rawScale = d; else CfgErr(ln, k, "expected a number in (0,100)"); }
 		else if (k == "offsens") { uintptr_t n = 0; if (ParseHex32(v, &n) && n < 0x10000) g_cfg.offSens = n; else CfgErr(ln, k, "expected hex offset < 0x10000"); }
 		else if (k == "offmousestate") { uintptr_t n = 0; if (ParseHex32(v, &n) && n < 0x10000) g_cfg.offMouseState = n; else CfgErr(ln, k, "expected hex offset < 0x10000"); }
-		else CfgErr(ln, k, "unknown key");
+		else
+		{
+			int ti = 0;
+			std::string sub;
+			if (!ParseTraceKey(k, &ti, &sub)) CfgErr(ln, k, "unknown key");
+			else if (sub.empty()) addr(g_cfg.trace[ti].addr);
+			else if (sub == "bytes") bytes(g_cfg.trace[ti].bytes);
+			else if (sub == "name") g_cfg.trace[ti].name = v.substr(0, 40);
+			else if (sub == "args") { int n = 0; if (ParseInt(v, 0, 8, &n)) g_cfg.trace[ti].args = n; else CfgErr(ln, k, "expected an integer 0..8"); }
+			else if (sub == "this") { int n = 0; if (ParseInt(v, 0, 16, &n)) g_cfg.trace[ti].thisDwords = n; else CfgErr(ln, k, "expected an integer 0..16"); }
+			else CfgErr(ln, k, "unknown trace sub-key (bytes|name|args|this)");
+		}
 	}
 	Log("cfg: parsed, %d error(s)%s", g_cfg.errors, g_cfg.errors ? " -> exe hooks will NOT be installed until the cfg is fixed" : "");
 }
@@ -456,6 +544,8 @@ static void ApplyCfg(Resolved& r)
 	fn(g_cfg.poll, r.poll, r.bPoll, g_cfg.bPoll);
 	fn(g_cfg.wnd, r.wnd, r.bWnd, g_cfg.bWnd);
 	fn(g_cfg.mapper, r.mapper, r.bMapper, g_cfg.bMapper);
+	fn(g_cfg.stickVirt, r.stickVirt, r.bStickVirt, g_cfg.bStickVirt);
+	fn(g_cfg.stickSmooth, r.stickSmooth, r.bStickSmooth, g_cfg.bStickSmooth);
 	auto d = [](const CfgAddr& a, uintptr_t& dst) { if (a.set) dst = a.v; };
 	d(g_cfg.accDX, r.accDX); d(g_cfg.accDY, r.accDY); d(g_cfg.flagCap, r.flagCap); d(g_cfg.flagRc, r.flagRc);
 	d(g_cfg.virtW, r.virtW); d(g_cfg.virtH, r.virtH); d(g_cfg.mgrPtr, r.mgrPtr);
@@ -527,6 +617,7 @@ static void ResolveTargets()
 
 	Log("targets (Ghidra address space; every hook also requires its .bytes to match memory):");
 	Log("  Mouse_GetState=%08X  PollMouseCursor=%08X  WndMsg=%08X  InputMapper=%08X", (unsigned)g_r.mgs, (unsigned)g_r.poll, (unsigned)g_r.wnd, (unsigned)g_r.mapper);
+	Log("  StickVirt(FUN_0040E680)=%08X StickSmooth(FUN_0040D820)=%08X", (unsigned)g_r.stickVirt, (unsigned)g_r.stickSmooth);
 	Log("  AccDX=%08X AccDY=%08X FlagCaptured=%08X FlagRecenter=%08X VirtW=%08X VirtH=%08X MgrPtr=%08X",
 		(unsigned)g_r.accDX, (unsigned)g_r.accDY, (unsigned)g_r.flagCap, (unsigned)g_r.flagRc, (unsigned)g_r.virtW, (unsigned)g_r.virtH, (unsigned)g_r.mgrPtr);
 }
@@ -540,6 +631,7 @@ enum Counter
 	C_GetCursorPos, C_SetCursorPos, C_ClipCursor, C_ShowCursor,
 	C_DI_Create, C_DI_MouseState, C_DI_MouseData, C_DI_MouseEvents, C_DI_OtherState, C_DI_OtherData,
 	C_RawEvents,
+	C_StickVirt, C_StickSmooth, C_RegRaw,
 	C_COUNT
 };
 static const char* kCounterName[C_COUNT] =
@@ -547,7 +639,8 @@ static const char* kCounterName[C_COUNT] =
 	"MouseGetState", "WndMsg", "WndMouseMove", "PollMouseCursor", "InputMapper",
 	"GetCursorPos", "SetCursorPos", "ClipCursor", "ShowCursor",
 	"DI8Create", "DI_mouse_State", "DI_mouse_Data", "DI_mouse_events", "DI_other_State", "DI_other_Data",
-	"raw_events"
+	"raw_events",
+	"StickVirt(E680)", "StickSmooth(D820)", "RegisterRawInputDevices"
 };
 static std::atomic<uint64_t> g_cnt[C_COUNT];
 static std::atomic<int> g_firstLogged[C_COUNT];
@@ -567,8 +660,9 @@ static void NoteCaller(Counter id, void* ra)
 // ----------------------------------------------------------------------------
 // Режим подмены входа (F9)
 // ----------------------------------------------------------------------------
-enum Mode { M_PASS = 0, M_RAW = 1, M_ZERO = 2 };
-static const char* kModeName[3] = { "PASS", "RAW", "ZERO" };
+// v4: подмена на входе DirectInput-мыши (то, что читает камера) и на входе Mouse_GetState (курсор/меню)
+enum Mode { M_PASS = 0, M_DI_ZERO = 1, M_DI_A = 2, M_DI_B = 3, M_DI_C = 4, M_ACC_ZERO = 5, M_COUNT = 6 };
+static const char* kModeName[M_COUNT] = { "PASS", "DI-ZERO", "DI-xA", "DI-xB", "DI-xC", "ACC-ZERO" };
 static std::atomic<int> g_mode{ M_PASS };
 static std::atomic<double> g_modeSince{ 0.0 };
 
@@ -602,7 +696,178 @@ static std::vector<Sample> g_samplesAcc, g_samplesDi;
 static int g_capIndex = 0;
 static double g_capStart = 0;
 static std::string g_capMeta;           // строки "# ..." для шапки CSV
+static std::string g_capMetaTail;       // строки "# ..." после остановки (raw_reference и т.п.)
 static int g_capClientW = 0, g_capClientH = 0;
+static bool g_stickVirtOn = false, g_stickSmoothOn = false;   // хуки конвейера "стик" установлены
+static int g_traceOn = 0;                                     // число установленных трассировщиков
+static std::atomic<bool> g_diMouseSeen{ false };              // игра хоть раз прочитала DI-мышь через GetDeviceState
+static uint64_t g_capRawStart = 0;                            // g_rawTotal на момент F7 (перенесено ниже, см. объявление)
+static std::atomic<LONG> g_diRepX{ 0 }, g_diRepY{ 0 };        // секундная сводка DI (до подмены)
+static double g_diRem[2] = { 0, 0 };                          // дробный остаток режимов DI-xK
+static int g_diRemMode = -1;
+static std::unordered_map<uintptr_t, float> g_clampOrig;      // исходные this[3] для возврата после F11 (трогает только поток игры)
+
+// ----------------------------------------------------------------------------
+// Конвейер "стик": FUN_0040E680 (мышь как виртуальный стик, круговой клэмп) и FUN_0040D820 (окно времени + клэмп).
+// Оба __thiscall (this = ecx), аргументы на стеке, стек чистит вызываемый (ret 0xC), поэтому хук-обёртка
+// объявлена как __fastcall(self, edx_мусор, аргументы...), а оригинал вызывается через unsafe_thiscall.
+// Смещения полей this - из декомпиляции Ghidra (1.0.0.1); если они неверны, поля в логе будут мусорными, игре это не вредит
+// (поля только читаются; единственная запись - this[3] в режиме F11).
+// ----------------------------------------------------------------------------
+struct VRec { double t; uint32_t arg0, id; uint8_t active; float x, y, accx, accy; };
+struct SRec { double t; float dt, xin, yin, xout, yout; uint32_t id; float win, blend, clamp; uint8_t active; float w[8]; uint32_t ret; };
+struct TraceRec { double t; uint8_t id; uint32_t ecx, edx, ra; uint32_t a[8]; uint32_t th[16]; };
+
+static std::mutex g_stickMu;
+static std::vector<VRec> g_recV;
+static std::vector<SRec> g_recS;
+static std::vector<TraceRec> g_recT;
+static std::atomic<bool> g_openClamp{ false };
+static safetyhook::InlineHook hkStickVirt, hkStickSmooth;
+// максимумы за секунду для сводки (пишет поток игры, читает поток пробы; гонка безвредна)
+static std::atomic<float> g_vMaxX{ 0 }, g_vMaxY{ 0 }, g_vMaxLen{ 0 }, g_sMaxX{ 0 }, g_sMaxY{ 0 };
+static std::atomic<int> g_vSat{ 0 };
+
+static void MaxF(std::atomic<float>& a, float v) { if (v > a.load(std::memory_order_relaxed)) a.store(v, std::memory_order_relaxed); }
+static float BitsToF(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
+
+static void OnStickVirt(void* self, uint32_t arg0, const float* x, const float* y)
+{
+	Count(C_StickVirt);
+	const uintptr_t s = reinterpret_cast<uintptr_t>(self);
+	VRec r = {};
+	r.t = NowMs() - g_capStart;
+	r.arg0 = arg0;
+	ReadT(reinterpret_cast<uintptr_t>(x), &r.x);
+	ReadT(reinterpret_cast<uintptr_t>(y), &r.y);
+	ReadT(s + 4, &r.id);
+	ReadT(s + 8, &r.active);
+	ReadT(s + 0xC, &r.accx);
+	ReadT(s + 0x10, &r.accy);
+	if (FiniteF(r.x, 1.0e9f)) MaxF(g_vMaxX, std::fabs(r.x));
+	if (FiniteF(r.y, 1.0e9f)) MaxF(g_vMaxY, std::fabs(r.y));
+	const float len = std::sqrt(r.accx * r.accx + r.accy * r.accy);
+	if (FiniteF(len, 1.0e9f))
+	{
+		MaxF(g_vMaxLen, len);
+		if (len >= 0.999f) g_vSat.fetch_add(1, std::memory_order_relaxed);
+	}
+	if (FirstN(C_StickVirt))
+		Log("StickVirt(FUN_0040E680): this=%08X arg0=%08X id=%u active=%u out=(%.5f,%.5f) acc=(%.5f,%.5f) len=%.5f",
+			(unsigned)s, (unsigned)arg0, (unsigned)r.id, (unsigned)r.active, (double)r.x, (double)r.y, (double)r.accx, (double)r.accy, (double)len);
+	if (!g_capturing.load()) return;
+	std::lock_guard<std::mutex> lk(g_stickMu);
+	if (g_recV.size() < opt::kMaxRecs) g_recV.push_back(r);
+}
+
+static void OnStickSmooth(void* self, float dt, float xin, float yin, const float* x, const float* y, uint32_t ret)
+{
+	Count(C_StickSmooth);
+	const uintptr_t s = reinterpret_cast<uintptr_t>(self);
+	SRec r = {};
+	r.t = NowMs() - g_capStart;
+	r.dt = dt; r.xin = xin; r.yin = yin; r.ret = ret;
+	ReadT(reinterpret_cast<uintptr_t>(x), &r.xout);
+	ReadT(reinterpret_cast<uintptr_t>(y), &r.yout);
+	ReadT(s, &r.id);
+	ReadT(s + 4, &r.win);
+	ReadT(s + 8, &r.blend);
+	ReadT(s + 0xC, &r.clamp);
+	ReadT(s + 0x30, &r.active);
+	ReadBytes(s + 0x10, r.w, sizeof(r.w)); // this[4..0xB]: текущее и прошлое окно
+	if (FiniteF(r.xout, 1.0e9f)) MaxF(g_sMaxX, std::fabs(r.xout));
+	if (FiniteF(r.yout, 1.0e9f)) MaxF(g_sMaxY, std::fabs(r.yout));
+	if (FirstN(C_StickSmooth))
+		Log("StickSmooth(FUN_0040D820): this=%08X dt=%.5f in=(%.5f,%.5f) out=(%.5f,%.5f) id=%u win=%.4f blend=%.4f clamp=%.4f active=%u ret=%08X cur=(%.3f,%.3f,%.3f,%.3f) prev=(%.3f,%.3f,%.3f,%.3f)",
+			(unsigned)s, (double)dt, (double)xin, (double)yin, (double)r.xout, (double)r.yout, (unsigned)r.id, (double)r.win, (double)r.blend, (double)r.clamp,
+			(unsigned)r.active, (unsigned)ret, (double)r.w[0], (double)r.w[1], (double)r.w[2], (double)r.w[3], (double)r.w[4], (double)r.w[5], (double)r.w[6], (double)r.w[7]);
+	if (!g_capturing.load()) return;
+	std::lock_guard<std::mutex> lk(g_stickMu);
+	if (g_recS.size() < opt::kMaxRecs) g_recS.push_back(r);
+}
+
+static void __fastcall StickVirt_H(void* self, void* /*edx*/, uint32_t arg0, float* x, float* y)
+{
+	hkStickVirt.unsafe_thiscall<void>(self, arg0, x, y);
+	OnStickVirt(self, arg0, x, y);
+}
+
+static uint32_t __fastcall StickSmooth_H(void* self, void* /*edx*/, float dt, float* x, float* y)
+{
+	float xin = 0, yin = 0;
+	ReadT(reinterpret_cast<uintptr_t>(x), &xin);
+	ReadT(reinterpret_cast<uintptr_t>(y), &yin);
+	const uintptr_t sp = reinterpret_cast<uintptr_t>(self);
+	if (g_openClamp.load(std::memory_order_relaxed)) // F11: this[3] := "без клэмпа" (исходное значение запоминаем)
+	{
+		if (g_clampOrig.find(sp) == g_clampOrig.end()) { float o = 0; if (ReadT(sp + 0xC, &o)) g_clampOrig[sp] = o; }
+		WriteT(sp + 0xC, 1.0e9f);
+	}
+	else if (!g_clampOrig.empty())
+	{
+		const auto it = g_clampOrig.find(sp);
+		if (it != g_clampOrig.end()) { WriteT(sp + 0xC, it->second); g_clampOrig.erase(it); }
+	}
+	const uint32_t r = hkStickSmooth.unsafe_thiscall<uint32_t>(self, dt, x, y);
+	OnStickSmooth(self, dt, xin, yin, x, y, r);
+	return r;
+}
+
+// ----------------------------------------------------------------------------
+// Трассировщики Trace1..Trace8 (из cfg): mid-хук на ВХОДЕ функции, соглашение вызова неизвестно и не нужно:
+// снимаем ecx, edx, адрес возврата, до 8 dword стека и до 16 dword объекта this (= ecx).
+// ----------------------------------------------------------------------------
+struct TraceState
+{
+	bool on = false;
+	std::string name;
+	uintptr_t addr = 0;
+	int args = 6, thisDw = 8;
+	std::atomic<uint64_t> calls{ 0 };
+};
+static TraceState g_trace[opt::kMaxTracers];
+static SafetyHookMid g_traceHooks[opt::kMaxTracers];
+
+static void OnTrace(int id, safetyhook::Context& ctx)
+{
+	TraceState& ts = g_trace[id];
+	const uint64_t n = ts.calls.fetch_add(1, std::memory_order_relaxed) + 1;
+	const uint32_t ecx = (uint32_t)ctx.ecx, edx = (uint32_t)ctx.edx, esp = (uint32_t)ctx.esp;
+	uint32_t ra = 0, a[8] = {}, th[16] = {};
+	ReadT(esp, &ra);
+	if (ts.args > 0) ReadBytes(esp + 4, a, sizeof(uint32_t) * (size_t)ts.args);
+	if (ts.thisDw > 0 && PlausiblePtr(ecx)) ReadBytes(ecx, th, sizeof(uint32_t) * (size_t)ts.thisDw);
+	if (n <= 12)
+	{
+		std::string s;
+		char b[48];
+		for (int i = 0; i < ts.args; ++i) { snprintf(b, sizeof(b), " a%d=%08X(%.4g)", i, (unsigned)a[i], (double)BitsToF(a[i])); s += b; }
+		Log("Trace%d %s #%llu: ecx=%08X edx=%08X ret=%s%s", id + 1, ts.name.c_str(), (unsigned long long)n, (unsigned)ecx, (unsigned)edx, Where(reinterpret_cast<void*>(ra)).c_str(), s.c_str());
+		if (ts.thisDw > 0 && PlausiblePtr(ecx))
+		{
+			s.clear();
+			for (int i = 0; i < ts.thisDw; ++i) { snprintf(b, sizeof(b), " %08X(%.4g)", (unsigned)th[i], (double)BitsToF(th[i])); s += b; }
+			Log("    this[0..%d]:%s", ts.thisDw - 1, s.c_str());
+		}
+	}
+	if (!g_capturing.load()) return;
+	TraceRec r = {};
+	r.t = NowMs() - g_capStart; r.id = (uint8_t)id; r.ecx = ecx; r.edx = edx; r.ra = ra;
+	memcpy(r.a, a, sizeof(a)); memcpy(r.th, th, sizeof(th));
+	std::lock_guard<std::mutex> lk(g_stickMu);
+	if (g_recT.size() < opt::kMaxRecs) g_recT.push_back(r);
+}
+
+template <int N> static void MidTrace(safetyhook::Context& ctx) { OnTrace(N, ctx); }
+template <size_t... I> static std::array<safetyhook::MidHookFn, sizeof...(I)> MakeTraceFns(std::index_sequence<I...>)
+{
+	return std::array<safetyhook::MidHookFn, sizeof...(I)>{ { &MidTrace<(int)I>... } };
+}
+static const std::array<safetyhook::MidHookFn, opt::kMaxTracers> kTraceFns = MakeTraceFns(std::make_index_sequence<opt::kMaxTracers>{});
+
+static std::atomic<double> g_lastRawMs{ -1.0 };   // время последнего события Raw Input (мс от старта), -1 = не было
+static std::atomic<uint64_t> g_rawTotal{ 0 };
+static HWND g_rawHwnd = nullptr;                  // скрытое окно потока Raw Input: по нему видно, чья регистрация действует
 
 static LRESULT CALLBACK RawWndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
@@ -622,6 +887,8 @@ static LRESULT CALLBACK RawWndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 					if (x || y)
 					{
 						Count(C_RawEvents);
+						g_rawTotal.fetch_add(1, std::memory_order_relaxed);
+						g_lastRawMs.store(NowMs(), std::memory_order_relaxed);
 						g_rawPairAccX += x; g_rawPairAccY += y;
 						g_rawPairDiX += x;  g_rawPairDiY += y;
 						g_rawRepX += x;     g_rawRepY += y;
@@ -644,6 +911,7 @@ static DWORD WINAPI RawThread(LPVOID)
 	RegisterClassExW(&wc);
 	// Скрытое окно верхнего уровня (не показываем): надёжнее, чем message-only
 	HWND hw = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, g_self, nullptr);
+	g_rawHwnd = hw;
 	RAWINPUTDEVICE rid = {};
 	rid.usUsagePage = 0x01;
 	rid.usUsage = 0x02;
@@ -654,6 +922,27 @@ static DWORD WINAPI RawThread(LPVOID)
 	MSG msg;
 	while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
 	return 0;
+}
+
+// Чья регистрация Raw Input действует сейчас (одна запись на (usagePage,usage) на процесс; новая заменяет старую)
+static void LogRegisteredRaw(const char* why)
+{
+	UINT n = 0;
+	GetRegisteredRawInputDevices(nullptr, &n, sizeof(RAWINPUTDEVICE));
+	if (n == 0 || n > 32) { Log("raw registered (%s): count=%u", why, (unsigned)n); return; }
+	std::vector<RAWINPUTDEVICE> v(n);
+	UINT m = n;
+	const UINT got = GetRegisteredRawInputDevices(v.data(), &m, sizeof(RAWINPUTDEVICE));
+	if (got == (UINT)-1) { Log("raw registered (%s): GetRegisteredRawInputDevices failed", why); return; }
+	std::string s;
+	char b[120];
+	for (UINT i = 0; i < got && i < n; ++i)
+	{
+		snprintf(b, sizeof(b), " [page=0x%X usage=0x%X flags=0x%lX hwnd=%p%s]", (unsigned)v[i].usUsagePage, (unsigned)v[i].usUsage,
+			(unsigned long)v[i].dwFlags, (void*)v[i].hwndTarget, (v[i].hwndTarget && v[i].hwndTarget == g_rawHwnd) ? " OURS" : "");
+		s += b;
+	}
+	Log("raw registered (%s): %u device(s):%s", why, (unsigned)got, s.c_str());
 }
 
 // ----------------------------------------------------------------------------
@@ -807,8 +1096,6 @@ static void OnInputMapper(uintptr_t self)
 // ----------------------------------------------------------------------------
 static bool g_accOk = false;        // данные AccDX/AccDY проверены
 static bool g_mgsHooked = false;
-static double g_remX = 0, g_remY = 0;
-static int g_lastModeSeen = M_PASS;
 static bool g_writeFailed = false;
 
 // [esp]=ret, [esp+4]=param_1, [esp+8]=hWnd, [esp+0xC]=msg (раскладка Mouse_WndMsg в обеих сборках)
@@ -840,17 +1127,9 @@ static void OnMouseGetState()
 	int ox = dx, oy = dy;
 
 	const int mode = g_mode.load();
-	if (mode != g_lastModeSeen) { g_remX = g_remY = 0; g_lastModeSeen = mode; }
-	if (g_accOk && mode != M_PASS)
+	if (g_accOk && mode == M_ACC_ZERO) // единственный режим на пути аккумулятора (курсор/меню); камера от него не зависит
 	{
-		if (mode == M_ZERO) { ox = 0; oy = 0; }
-		else // M_RAW: счёты мыши как есть (с дробным остатком, чтобы медленные движения не терялись)
-		{
-			g_remX += (double)rx * g_cfg.rawScale;
-			g_remY += (double)ry * g_cfg.rawScale;
-			ox = (int)g_remX; oy = (int)g_remY;
-			g_remX -= ox; g_remY -= oy;
-		}
+		ox = 0; oy = 0;
 		if (!WriteT(Rebase(g_r.accDX), ox) || !WriteT(Rebase(g_r.accDY), oy))
 		{
 			if (!g_writeFailed) { g_writeFailed = true; Log("ERROR: writing the accumulator failed -> mode forced to PASS"); }
@@ -886,6 +1165,12 @@ static void StartCapture()
 		g_samplesAcc.clear();
 		g_samplesDi.clear();
 	}
+	{
+		std::lock_guard<std::mutex> lk(g_stickMu);
+		g_recV.clear(); g_recS.clear(); g_recT.clear();
+	}
+	g_capRawStart = g_rawTotal.load();
+	for (TraceState& t : g_trace) t.calls.store(0);
 	g_rawCapX = 0; g_rawCapY = 0; g_diCapX = 0; g_diCapY = 0;
 	g_rawPairAccX = 0; g_rawPairAccY = 0; g_pendRawX = 0; g_pendRawY = 0; g_rawPairDiX = 0; g_rawPairDiY = 0;
 	++g_capIndex;
@@ -900,6 +1185,11 @@ static void StartCapture()
 	snprintf(b, sizeof(b), "# client=%dx%d half=%d,%d\n", cw, ch, cw / 2 - 1, ch / 2 - 1); g_capMeta += b;
 	snprintf(b, sizeof(b), "# pairing=%s mapper=%s mode_at_start=%s rawscale=%.4f\n", g_wmMoveEver.load() ? "wm_mousemove" : "direct(WndMsg hook not seen)",
 		g_mapperDead ? "dead" : (g_mapperGood ? "ok" : "no-calls-yet"), kModeName[g_mode.load()], g_cfg.rawScale); g_capMeta += b;
+	snprintf(b, sizeof(b), "# v4 hooks: stick_virt=%d stick_smooth=%d traces=%d di_mouse_seen=%d openclamp=%d di_scales(A,B,C)=%.3f,%.3f,%.3f\n",
+		(int)g_stickVirtOn, (int)g_stickSmoothOn, g_traceOn, (int)g_diMouseSeen.load(), (int)g_openClamp.load(), g_cfg.diScale[0], g_cfg.diScale[1], g_cfg.diScale[2]); g_capMeta += b;
+	snprintf(b, sizeof(b), "# mode_codes=v4 (0 PASS, 1 DI-ZERO, 2 DI-xA, 3 DI-xB, 4 DI-xC, 5 ACC-ZERO)\n"); g_capMeta += b;
+	for (int i = 0; i < opt::kMaxTracers; ++i)
+		if (g_trace[i].on) { snprintf(b, sizeof(b), "# trace%d name=%s addr=%08X args=%d this_dwords=%d\n", i + 1, g_trace[i].name.c_str(), (unsigned)g_trace[i].addr, g_trace[i].args, g_trace[i].thisDw); g_capMeta += b; }
 	g_capMeta += "# conditions: " + cond + "\n";
 
 	g_capStart = NowMs();
@@ -907,6 +1197,7 @@ static void StartCapture()
 	Log("=== CAPTURE %d START === mode=%s", g_capIndex, kModeName[g_mode.load()]);
 	Log("conditions: %s", cond.c_str());
 	if (!g_mgsHooked || !g_accOk) Log("  NOTE: Mouse_GetState hook or Acc addresses unavailable -> no _acc.csv will be produced (only _di)");
+	LogRegisteredRaw("capture start");
 	Tone(1, 1200);
 }
 
@@ -928,11 +1219,12 @@ static void DumpAcc(int idx, const std::vector<Sample>& v)
 	if (f)
 	{
 		fputs(g_capMeta.c_str(), f);
+		fputs(g_capMetaTail.c_str(), f);
 		fputs("t_ms,raw_dx,raw_dy,game_dx,game_dy,mode,out_dx,out_dy,look_x,look_y,sens,cap,rc\n", f);
 	}
 	const int halfW = g_capClientW / 2 - 1, halfH = g_capClientH / 2 - 1;
 	double pathRaw = 0, pathGame = 0, pathOut = 0, netRX = 0, netRY = 0, netGX = 0, netGY = 0;
-	int nSatX = 0, nSatY = 0, nRawOverX = 0, nRawOverY = 0, modeFrames[3] = { 0, 0, 0 }, nLook = 0;
+	int nSatX = 0, nSatY = 0, nRawOverX = 0, nRawOverY = 0, modeFrames[M_COUNT] = {}, nLook = 0;
 	std::vector<double> dts;
 	for (size_t i = 0; i < v.size(); ++i)
 	{
@@ -952,7 +1244,7 @@ static void DumpAcc(int idx, const std::vector<Sample>& v)
 		if (halfH > 0 && std::abs(s.gy) >= (int)(0.9 * halfH)) ++nSatY;
 		if (halfW > 0 && std::abs(s.rx) > halfW) ++nRawOverX;
 		if (halfH > 0 && std::abs(s.ry) > halfH) ++nRawOverY;
-		if (s.mode >= 0 && s.mode < 3) ++modeFrames[s.mode];
+		if (s.mode >= 0 && s.mode < M_COUNT) ++modeFrames[s.mode];
 		if (s.lookValid) ++nLook;
 	}
 	if (f) fclose(f);
@@ -961,7 +1253,7 @@ static void DumpAcc(int idx, const std::vector<Sample>& v)
 		dts.empty() ? 0.0 : *std::min_element(dts.begin(), dts.end()), dts.empty() ? 0.0 : *std::max_element(dts.begin(), dts.end()));
 	Log("  [acc] raw net=(%.0f,%.0f) path=%.0f | game net=(%.0f,%.0f) path=%.0f | out path=%.0f | game/raw path=%.3f",
 		netRX, netRY, pathRaw, netGX, netGY, pathGame, pathOut, pathRaw > 0 ? pathGame / pathRaw : 0.0);
-	Log("  [acc] frames by mode: PASS=%d RAW=%d ZERO=%d | look valid in %d frames", modeFrames[0], modeFrames[1], modeFrames[2], nLook);
+	Log("  [acc] frames by mode: PASS=%d DI-ZERO=%d DI-xA=%d DI-xB=%d DI-xC=%d ACC-ZERO=%d | look valid in %d frames", modeFrames[0], modeFrames[1], modeFrames[2], modeFrames[3], modeFrames[4], modeFrames[5], nLook);
 	Log("  [acc] CEILING check (half client = %d,%d): game>=90%% of half: X=%d Y=%d frames | raw>half: X=%d Y=%d frames  <- raw>half with game stuck at half = saturation before the accumulator",
 		halfW, halfH, nSatX, nSatY, nRawOverX, nRawOverY);
 	if (netRX != 0 && netGX != 0 && (netRX > 0) != (netGX > 0)) Log("  [acc] WARNING: net X of raw and game have OPPOSITE signs - check the axis direction before trusting ratios");
@@ -976,17 +1268,103 @@ static void DumpDi(int idx, const std::vector<Sample>& v)
 	const std::wstring path = SessionPath(wname);
 	FILE* f = nullptr;
 	_wfopen_s(&f, path.c_str(), L"wt");
-	double pathRaw = 0, pathGame = 0;
-	if (f) { fputs(g_capMeta.c_str(), f); fputs("t_ms,raw_dx,raw_dy,game_dx,game_dy\n", f); }
+	double pathRaw = 0, pathGame = 0, pathOut = 0;
+	int modeFrames[M_COUNT] = {};
+	if (f)
+	{
+		fputs(g_capMeta.c_str(), f);
+		fputs(g_capMetaTail.c_str(), f);
+		fputs("t_ms,raw_dx,raw_dy,game_dx,game_dy,mode,out_dx,out_dy\n", f); // game_* = DI до подмены, out_* = что получила игра
+	}
 	for (const Sample& s : v)
 	{
-		if (f) fprintf(f, "%.3f,%ld,%ld,%d,%d\n", s.t, s.rx, s.ry, s.gx, s.gy);
+		if (f) fprintf(f, "%.3f,%ld,%ld,%d,%d,%d,%d,%d\n", s.t, s.rx, s.ry, s.gx, s.gy, s.mode, s.ox, s.oy);
 		pathRaw += std::hypot((double)s.rx, (double)s.ry);
 		pathGame += std::hypot((double)s.gx, (double)s.gy);
+		pathOut += std::hypot((double)s.ox, (double)s.oy);
+		if (s.mode >= 0 && s.mode < M_COUNT) ++modeFrames[s.mode];
 	}
 	if (f) fclose(f);
-	Log("  [di] %zu samples: raw path=%.0f | DI path=%.0f | ratio=%.3f", v.size(), pathRaw, pathGame, pathRaw > 0 ? pathGame / pathRaw : 0.0);
+	Log("  [di] %zu samples: raw path=%.0f | DI path=%.0f | game-got path=%.0f | DI/raw=%.3f", v.size(), pathRaw, pathGame, pathOut, pathRaw > 0 ? pathGame / pathRaw : 0.0);
+	Log("  [di] frames by mode: PASS=%d DI-ZERO=%d DI-xA=%d DI-xB=%d DI-xC=%d ACC-ZERO=%d", modeFrames[0], modeFrames[1], modeFrames[2], modeFrames[3], modeFrames[4], modeFrames[5]);
 	Log("  [di] csv: %ls", path.c_str());
+}
+
+static void DumpStick(int idx, const std::vector<VRec>& rv, const std::vector<SRec>& rs, const std::vector<TraceRec>& rt)
+{
+	wchar_t wname[96];
+	if (rv.empty()) Log("  [stickv] no calls of FUN_0040E680 during the capture (hook off or the function is not used in this situation)");
+	else
+	{
+		swprintf(wname, 96, L"ds3probe_cap_%03d_stickv.csv", idx);
+		FILE* f = nullptr;
+		_wfopen_s(&f, SessionPath(wname).c_str(), L"wt");
+		double mx = 0, my = 0, ml = 0;
+		size_t sat = 0, act = 0;
+		if (f) { fputs(g_capMeta.c_str(), f); fputs(g_capMetaTail.c_str(), f); fputs("t_ms,arg0_hex,id,active,x_out,y_out,acc_x,acc_y\n", f); }
+		for (const VRec& r : rv)
+		{
+			if (f) fprintf(f, "%.3f,%08X,%u,%u,%.6f,%.6f,%.6f,%.6f\n", r.t, (unsigned)r.arg0, (unsigned)r.id, (unsigned)r.active, (double)r.x, (double)r.y, (double)r.accx, (double)r.accy);
+			if (FiniteF(r.x, 1.0e9f)) mx = std::max(mx, (double)std::fabs(r.x));
+			if (FiniteF(r.y, 1.0e9f)) my = std::max(my, (double)std::fabs(r.y));
+			const double len = std::hypot((double)r.accx, (double)r.accy);
+			ml = std::max(ml, len);
+			if (len >= 0.999) ++sat;
+			if (r.active) ++act;
+		}
+		if (f) fclose(f);
+		Log("  [stickv] FUN_0040E680: %zu calls, active=%zu, max|out|=(%.4f,%.4f), max len(acc)=%.4f, frames with len>=0.999 (unit-circle clamp reached): %zu", rv.size(), act, mx, my, ml, sat);
+	}
+	if (rs.empty()) Log("  [sticks] no calls of FUN_0040D820 during the capture (hook off or the function is not used in this situation)");
+	else
+	{
+		swprintf(wname, 96, L"ds3probe_cap_%03d_sticks.csv", idx);
+		FILE* f = nullptr;
+		_wfopen_s(&f, SessionPath(wname).c_str(), L"wt");
+		double mx = 0, my = 0, mclamp = 0, mxin = 0;
+		size_t act = 0;
+		if (f)
+		{
+			fputs(g_capMeta.c_str(), f); fputs(g_capMetaTail.c_str(), f);
+			fputs("t_ms,dt,x_in,y_in,x_out,y_out,id,win,blend,clamp,active,w0,w1,w2,w3,w4,w5,w6,w7,ret_hex\n", f);
+		}
+		for (const SRec& r : rs)
+		{
+			if (f)
+				fprintf(f, "%.3f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f,%.6f,%.6f,%u,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%08X\n", r.t, (double)r.dt, (double)r.xin, (double)r.yin,
+					(double)r.xout, (double)r.yout, (unsigned)r.id, (double)r.win, (double)r.blend, (double)r.clamp, (unsigned)r.active,
+					(double)r.w[0], (double)r.w[1], (double)r.w[2], (double)r.w[3], (double)r.w[4], (double)r.w[5], (double)r.w[6], (double)r.w[7], (unsigned)r.ret);
+			if (FiniteF(r.xout, 1.0e9f)) mx = std::max(mx, (double)std::fabs(r.xout));
+			if (FiniteF(r.yout, 1.0e9f)) my = std::max(my, (double)std::fabs(r.yout));
+			if (FiniteF(r.xin, 1.0e9f)) mxin = std::max(mxin, (double)std::fabs(r.xin));
+			if (FiniteF(r.clamp, 1.0e12f)) mclamp = std::max(mclamp, (double)std::fabs(r.clamp));
+			if (r.active) ++act;
+		}
+		if (f) fclose(f);
+		Log("  [sticks] FUN_0040D820: %zu calls, active=%zu, max|in.x|=%.4f, max|out|=(%.4f,%.4f), max clamp=%.4f%s", rs.size(), act, mxin, mx, my, mclamp,
+			g_openClamp.load() ? " (F11 open-clamp was ON)" : "");
+	}
+	if (!rt.empty())
+	{
+		swprintf(wname, 96, L"ds3probe_cap_%03d_trace.csv", idx);
+		FILE* f = nullptr;
+		_wfopen_s(&f, SessionPath(wname).c_str(), L"wt");
+		if (f)
+		{
+			fputs(g_capMeta.c_str(), f); fputs(g_capMetaTail.c_str(), f);
+			fputs("t_ms,id,ecx,edx,ret,a0,a1,a2,a3,a4,a5,a6,a7,t0,t1,t2,t3,t4,t5,t6,t7,t8,t9,t10,t11,t12,t13,t14,t15\n", f);
+			for (const TraceRec& r : rt)
+			{
+				fprintf(f, "%.3f,%u,%08X,%08X,%08X", r.t, (unsigned)r.id + 1, (unsigned)r.ecx, (unsigned)r.edx, (unsigned)r.ra);
+				for (int i = 0; i < 8; ++i) fprintf(f, ",%08X", (unsigned)r.a[i]);
+				for (int i = 0; i < 16; ++i) fprintf(f, ",%08X", (unsigned)r.th[i]);
+				fputc('\n', f);
+			}
+			fclose(f);
+		}
+		for (int i = 0; i < opt::kMaxTracers; ++i)
+			if (g_trace[i].on) Log("  [trace%d] %s @%08X: %llu calls in the capture", i + 1, g_trace[i].name.c_str(), (unsigned)g_trace[i].addr, (unsigned long long)g_trace[i].calls.load());
+	}
 }
 
 static void StopCapture()
@@ -998,11 +1376,31 @@ static void StopCapture()
 		acc.swap(g_samplesAcc);
 		di.swap(g_samplesDi);
 	}
+	std::vector<VRec> rv;
+	std::vector<SRec> rs;
+	std::vector<TraceRec> rt;
+	{
+		std::lock_guard<std::mutex> lk(g_stickMu);
+		rv.swap(g_recV); rs.swap(g_recS); rt.swap(g_recT);
+	}
+	// жив ли эталон Raw Input: события были в окне захвата и последнее не старше 2 с
+	{
+		const uint64_t ev = g_rawTotal.load() - g_capRawStart;
+		const double last = g_lastRawMs.load();
+		const bool alive = ev > 0 && last >= 0 && (NowMs() - last) < 2000.0;
+		char b[200];
+		snprintf(b, sizeof(b), "# raw_reference=%s raw_events_in_capture=%llu last_raw_event_age_s=%.1f\n", alive ? "alive" : "DEAD", (unsigned long long)ev,
+			last >= 0 ? (NowMs() - last) / 1000.0 : -1.0);
+		g_capMetaTail = b;
+		Log("  raw reference: %s", b + 2);
+	}
+	LogRegisteredRaw("capture stop");
 	Log("=== CAPTURE %d STOP (%.1f s) ===", g_capIndex, (NowMs() - g_capStart) / 1000.0);
 	Log("  Raw Input total while focused: net=(%ld,%ld)", g_rawCapX.load(), g_rawCapY.load());
 	Log("  DirectInput mouse total: net=(%ld,%ld)", g_diCapX.load(), g_diCapY.load());
 	DumpAcc(g_capIndex, acc);
 	DumpDi(g_capIndex, di);
+	DumpStick(g_capIndex, rv, rs, rt);
 	Log("  next: python analyze_samples.py <session folder>\\ds3probe_cap_%03d_acc.csv", g_capIndex);
 	Tone(2, 1200);
 }
@@ -1053,6 +1451,32 @@ static int WINAPI ShowCursor_H(BOOL show)
 	return hkShowCursor.unsafe_stdcall<int>(show);
 }
 
+// v4: кто и с какими флагами регистрирует Raw Input. Одна запись на (usagePage, usage) на процесс, новая заменяет
+// старую: так видно, что DirectInput игры перехватывает мышь у нашего окна. Сами НЕ перерегистрируем (сломали бы игру).
+static safetyhook::InlineHook hkRegRaw;
+
+static BOOL WINAPI RegRaw_H(PCRAWINPUTDEVICE devs, UINT n, UINT cb)
+{
+	void* ra = _ReturnAddress();
+	Count(C_RegRaw);
+	static std::atomic<int> nShown{ 0 };
+	if (nShown.fetch_add(1) < 40)
+	{
+		std::string s;
+		char b[140];
+		for (UINT i = 0; i < n && i < 8; ++i)
+		{
+			RAWINPUTDEVICE d = {};
+			if (!ReadT(reinterpret_cast<uintptr_t>(devs) + (uintptr_t)i * cb, &d)) { s += " [unreadable]"; break; }
+			snprintf(b, sizeof(b), " [page=0x%X usage=0x%X flags=0x%lX hwnd=%p%s]", (unsigned)d.usUsagePage, (unsigned)d.usUsage, (unsigned long)d.dwFlags,
+				(void*)d.hwndTarget, (d.hwndTarget && d.hwndTarget == g_rawHwnd) ? " OURS" : "");
+			s += b;
+		}
+		Log("RegisterRawInputDevices(n=%u,cb=%u)%s from %s", (unsigned)n, (unsigned)cb, s.c_str(), Where(ra).c_str());
+	}
+	return hkRegRaw.unsafe_stdcall<BOOL>(devs, n, cb);
+}
+
 static void InstallUser32Hooks()
 {
 	HMODULE u = GetModuleHandleW(L"user32.dll");
@@ -1068,6 +1492,7 @@ static void InstallUser32Hooks()
 	mk(hkSetCursorPos, "SetCursorPos", reinterpret_cast<void*>(&SetCursorPos_H));
 	mk(hkClipCursor,   "ClipCursor",   reinterpret_cast<void*>(&ClipCursor_H));
 	mk(hkShowCursor,   "ShowCursor",   reinterpret_cast<void*>(&ShowCursor_H));
+	mk(hkRegRaw,       "RegisterRawInputDevices", reinterpret_cast<void*>(&RegRaw_H));
 }
 
 // ----------------------------------------------------------------------------
@@ -1118,23 +1543,79 @@ static HRESULT WINAPI Acquire_H(void* self)
 	return hr;
 }
 
+// Похоже ли значение на адрес возврата: перед ним должна стоять инструкция CALL (rel32 / [abs32] / reg / [reg+disp])
+static bool LooksLikeCallRet(uintptr_t ra)
+{
+	if (!InImage(ra)) return false;
+	uint8_t b[8] = {};
+	if (!ReadBytes(ra - 8, b, sizeof(b))) return false; // b[i] = байт по адресу ra-8+i, т.е. b[7] = ra-1
+	if (b[3] == 0xE8) return true;                                  // call rel32            (ra-5)
+	if (b[2] == 0xFF && (b[3] == 0x15 || (b[3] & 0xF8) == 0x90)) return true; // call [abs32] / [reg+disp32] (ra-6)
+	if (b[6] == 0xFF && ((b[7] & 0xF8) == 0xD0 || (b[7] & 0xF8) == 0x10)) return true; // call reg / [reg] (ra-2)
+	if (b[5] == 0xFF && (b[6] & 0xF8) == 0x50) return true;         // call [reg+disp8]      (ra-3)
+	return false;
+}
+
+// Цепочка вероятных вызывающих: сканируем стек выше адреса возврата хука, берём значения в образе exe, перед которыми CALL.
+// Эвристика (в стеке бывают и старые значения), но для поиска "какая функция читает DI-мышь" её достаточно.
+static std::string StackCallers(const void* retLoc, int want)
+{
+	std::string s;
+	int found = 0;
+	const uintptr_t sp = reinterpret_cast<uintptr_t>(retLoc);
+	for (int i = 0; i < 256 && found < want; ++i)
+	{
+		uint32_t v = 0;
+		if (!ReadT(sp + 4u * (uintptr_t)i, &v)) break;
+		if (LooksLikeCallRet(v)) { if (found) s += "  <-  "; s += Where(reinterpret_cast<void*>((uintptr_t)v)); ++found; }
+	}
+	return found ? s : std::string("(no call-looking return addresses on the stack)");
+}
+
+static std::atomic<bool> g_diDumpCallers{ false };   // F6: следующее чтение DI-мыши выведет цепочку вызывающих
+
 static HRESULT WINAPI GetState_H(void* self, DWORD cb, void* data)
 {
+	const void* const retLoc = _AddressOfReturnAddress();
+	void* const ra = _ReturnAddress();
 	const HRESULT hr = hkGetState.unsafe_stdcall<HRESULT>(self, cb, data);
 	if (IsMouseDev(self))
 	{
 		Count(C_DI_MouseState);
 		if (SUCCEEDED(hr) && data && (cb == 16 || cb == 20)) // DIMOUSESTATE / DIMOUSESTATE2
 		{
-			const LONG* p = static_cast<const LONG*>(data);
+			LONG* p = static_cast<LONG*>(data);
+			g_diMouseSeen = true;
+			NoteCaller(C_DI_MouseState, ra);
 			static std::atomic<int> nShown{ 0 };
-			if (nShown.fetch_add(1) < 8) Log("DI mouse state: cb=%u lX=%ld lY=%ld lZ=%ld", (unsigned)cb, p[0], p[1], p[2]);
+			const int shown = nShown.fetch_add(1);
+			if (shown < 8) Log("DI mouse state: cb=%u lX=%ld lY=%ld lZ=%ld buf=%p from %s", (unsigned)cb, p[0], p[1], p[2], data, Where(ra).c_str());
+			if (shown < 2 || g_diDumpCallers.exchange(false)) Log("  DI mouse GetDeviceState callers: %s", StackCallers(retLoc, 6).c_str());
+
 			const LONG rx = g_rawPairDiX.exchange(0), ry = g_rawPairDiY.exchange(0);
+			const int bx = (int)p[0], by = (int)p[1];
+
+			// v4: подмена на входе DirectInput-мыши. Всё, что игра берёт отсюда (в т.ч. камера), увидит подменённое.
+			int ox = bx, oy = by;
+			const int mode = g_mode.load();
+			if (mode == M_DI_ZERO) { ox = 0; oy = 0; }
+			else if (mode >= M_DI_A && mode <= M_DI_C)
+			{
+				const double k = g_cfg.diScale[mode - M_DI_A];
+				if (g_diRemMode != mode) { g_diRem[0] = g_diRem[1] = 0; g_diRemMode = mode; }
+				const double vx = bx * k + g_diRem[0], vy = by * k + g_diRem[1];
+				ox = (int)std::floor(vx + 0.5); oy = (int)std::floor(vy + 0.5);
+				g_diRem[0] = vx - ox; g_diRem[1] = vy - oy;
+			}
+			else g_diRemMode = -1;
+			if (ox != bx || oy != by || mode == M_DI_ZERO) { p[0] = ox; p[1] = oy; }
+
+			g_diRepX += bx; g_diRepY += by;
 			if (g_capturing.load())
 			{
-				g_diCapX += p[0]; g_diCapY += p[1];
+				g_diCapX += bx; g_diCapY += by;
 				Sample s;
-				s.t = NowMs() - g_capStart; s.rx = rx; s.ry = ry; s.gx = (int)p[0]; s.gy = (int)p[1];
+				s.t = NowMs() - g_capStart; s.rx = rx; s.ry = ry; s.gx = bx; s.gy = by; s.ox = ox; s.oy = oy; s.mode = mode;
 				std::lock_guard<std::mutex> lk(g_capMu);
 				g_samplesDi.push_back(s);
 			}
@@ -1291,7 +1772,46 @@ static void InstallExeHooks()
 		mhMapper = safetyhook::create_mid(reinterpret_cast<void*>(Rebase(g_r.mapper)), &MidMapper);
 		Log("  InputMapper_Update hook: %s", mhMapper ? "ok" : "FAILED");
 	}
-	Log("exe hooks done: Mouse_GetState=%d acc=%d F9-modes=%s", (int)g_mgsHooked, (int)g_accOk, (g_mgsHooked && g_accOk) ? "available" : "UNAVAILABLE");
+
+	// Конвейер "стик": inline-хуки (нужны выходные значения после оригинала). Оба __thiscall, 3 аргумента на стеке (ret 0xC).
+	if (!g_cfg.stickHooks) Log("  stick hooks disabled by cfg (StickHooks = 0)");
+	else
+	{
+		if (FuncReady("StickVirt(FUN_0040E680)", g_r.stickVirt, g_r.bStickVirt))
+		{
+			hkStickVirt = safetyhook::create_inline(reinterpret_cast<void*>(Rebase(g_r.stickVirt)), reinterpret_cast<void*>(&StickVirt_H));
+			g_stickVirtOn = static_cast<bool>(hkStickVirt);
+			Log("  StickVirt hook: %s", g_stickVirtOn ? "ok" : "FAILED");
+		}
+		if (FuncReady("StickSmooth(FUN_0040D820)", g_r.stickSmooth, g_r.bStickSmooth))
+		{
+			hkStickSmooth = safetyhook::create_inline(reinterpret_cast<void*>(Rebase(g_r.stickSmooth)), reinterpret_cast<void*>(&StickSmooth_H));
+			g_stickSmoothOn = static_cast<bool>(hkStickSmooth);
+			Log("  StickSmooth hook: %s", g_stickSmoothOn ? "ok" : "FAILED");
+		}
+	}
+
+	// Трассировщики из cfg: mid-хук на входе функции; байты обязательны и должны совпасть
+	for (int i = 0; i < opt::kMaxTracers; ++i)
+	{
+		const TraceCfg& tc = g_cfg.trace[i];
+		if (!tc.addr.set) continue;
+		char nm[24];
+		snprintf(nm, sizeof(nm), "Trace%d", i + 1);
+		if (!tc.bytes.set) { Log("  %s=%08X: no .bytes -> skipped", nm, (unsigned)tc.addr.v); continue; }
+		if (!FuncReady(nm, tc.addr.v, tc.bytes.v)) continue;
+		g_traceHooks[i] = safetyhook::create_mid(reinterpret_cast<void*>(Rebase(tc.addr.v)), kTraceFns[i]);
+		if (g_traceHooks[i])
+		{
+			TraceState& ts = g_trace[i];
+			ts.on = true; ts.name = tc.name.empty() ? std::string(nm) : tc.name; ts.addr = tc.addr.v; ts.args = tc.args; ts.thisDw = tc.thisDwords;
+			++g_traceOn;
+		}
+		Log("  %s (%s) hook: %s", nm, tc.name.empty() ? "-" : tc.name.c_str(), g_traceHooks[i] ? "ok" : "FAILED");
+	}
+
+	Log("exe hooks done: Mouse_GetState=%d acc=%d stickVirt=%d stickSmooth=%d traces=%d | ACC-ZERO mode %s (DI modes need only the DI hook, see 'DI mouse state' lines)",
+		(int)g_mgsHooked, (int)g_accOk, (int)g_stickVirtOn, (int)g_stickSmoothOn, g_traceOn, (g_mgsHooked && g_accOk) ? "available" : "UNAVAILABLE");
 	LogConditions("after hooks");
 }
 
@@ -1346,12 +1866,20 @@ static void PrintSecond()
 		snprintf(b, sizeof(b), " look=(%.3f,%.3f) sens=%.3f", (double)g_lookX, (double)g_lookY, (double)g_sens);
 		s += b;
 	}
+	{
+		const LONG dx = g_diRepX.exchange(0), dy = g_diRepY.exchange(0);
+		if (dx || dy) { snprintf(b, sizeof(b), " DI=(%ld,%ld)", dx, dy); s += b; }
+		const float vx = g_vMaxX.exchange(0), vy = g_vMaxY.exchange(0), vl = g_vMaxLen.exchange(0), sx = g_sMaxX.exchange(0), sy = g_sMaxY.exchange(0);
+		const int vs = g_vSat.exchange(0);
+		if (g_stickVirtOn && (vx > 0 || vy > 0 || vl > 0)) { snprintf(b, sizeof(b), " stickV(max out=(%.3f,%.3f) acc_len=%.3f sat=%d)", (double)vx, (double)vy, (double)vl, vs); s += b; }
+		if (g_stickSmoothOn && (sx > 0 || sy > 0)) { snprintf(b, sizeof(b), " stickS(max out=(%.3f,%.3f))", (double)sx, (double)sy); s += b; }
+	}
 	Log("1s: %s", s.c_str());
 }
 
 static void DumpCallers()
 {
-	static const Counter apis[] = { C_GetCursorPos, C_SetCursorPos, C_ClipCursor, C_ShowCursor };
+	static const Counter apis[] = { C_GetCursorPos, C_SetCursorPos, C_ClipCursor, C_ShowCursor, C_DI_MouseState };
 	std::lock_guard<std::mutex> lk(g_callMu);
 	for (Counter id : apis)
 	{
@@ -1372,20 +1900,33 @@ static void SetMode(int m, const char* why)
 {
 	g_mode = m;
 	g_modeSince = NowMs();
-	Log("=== MODE -> %s (%s). PASS = game input untouched; RAW = accumulator := Raw Input * %.3f; ZERO = accumulator := 0 ===", kModeName[m], why, g_cfg.rawScale);
+	g_diRemMode = -1; // сброс дробного остатка режимов DI-xK
+	Log("=== MODE -> %s (%s). PASS = untouched; DI-ZERO = DirectInput mouse lX/lY := 0; DI-xA/xB/xC = lX/lY * %.3f / %.3f / %.3f; ACC-ZERO = cursor accumulator := 0 ===",
+		kModeName[m], why, g_cfg.diScale[0], g_cfg.diScale[1], g_cfg.diScale[2]);
 }
 
+// PASS(1 низкий писк) -> DI-ZERO(1) -> DI-xA(2) -> DI-xB(3) -> DI-xC(4) -> ACC-ZERO(5) -> PASS
 static void CycleMode()
 {
-	if (!(g_mgsHooked && g_accOk))
+	if (!g_diMouseSeen.load())
 	{
-		Log("F9: mode switch UNAVAILABLE (Mouse_GetState hook or Acc addresses missing, see 'exe hooks done' line)");
+		Log("F9: UNAVAILABLE - the game has not read the DirectInput mouse yet (no 'DI mouse state' lines), nothing to substitute");
 		Tone(1, 250);
 		return;
 	}
-	const int m = (g_mode.load() + 1) % 3;
+	int m = (g_mode.load() + 1) % M_COUNT;
+	if (m == M_ACC_ZERO && !(g_mgsHooked && g_accOk)) m = M_PASS; // режим курсорного пути доступен, только если стоит хук Mouse_GetState
 	SetMode(m, "F9");
-	Tone(m + 1, m == 0 ? 600 : (m == 1 ? 1000 : 1500));
+	if (m == M_PASS) Tone(1, 300); else Tone(m, 700 + 150 * m);
+}
+
+static void ToggleOpenClamp()
+{
+	if (!g_stickSmoothOn) { Log("F11: UNAVAILABLE (StickSmooth hook FUN_0040D820 is not installed)"); Tone(1, 250); return; }
+	const bool on = !g_openClamp.load();
+	g_openClamp = on;
+	Log("=== F11: open-clamp %s (FUN_0040D820 this[3] := %s) ===", on ? "ON" : "OFF", on ? "1e9 on every call (the original is restored when OFF)" : "original value");
+	Tone(on ? 2 : 1, on ? 1800 : 500);
 }
 
 static DWORD WINAPI WorkerThread(LPVOID)
@@ -1404,7 +1945,7 @@ static DWORD WINAPI WorkerThread(LPVOID)
 
 	const double t0 = NowMs();
 	double nextSec = t0 + 1000.0, d3d9Seen = -1.0;
-	bool k6 = false, k7 = false, k8 = false, k9 = false, k10 = false;
+	bool k6 = false, k7 = false, k8 = false, k9 = false, k10 = false, k11 = false;
 	int marker = 0;
 
 	for (;;)
@@ -1423,13 +1964,14 @@ static DWORD WINAPI WorkerThread(LPVOID)
 
 		const bool fg = GameFocused();
 		const bool n6 = fg && KeyDown(opt::kVkMarker), n7 = fg && KeyDown(opt::kVkStart), n8 = fg && KeyDown(opt::kVkStop);
-		const bool n9 = fg && KeyDown(opt::kVkMode), n10 = fg && KeyDown(opt::kVkInfo);
-		if (n6 && !k6) { Log("=== MARKER %d ===", ++marker); DumpCallers(); }
+		const bool n9 = fg && KeyDown(opt::kVkMode), n10 = fg && KeyDown(opt::kVkInfo), n11 = fg && KeyDown(opt::kVkOpen);
+		if (n6 && !k6) { Log("=== MARKER %d ===", ++marker); DumpCallers(); g_diDumpCallers = true; }
 		if (n7 && !k7) StartCapture();
 		if (n8 && !k8) StopCapture();
 		if (n9 && !k9) CycleMode();
-		if (n10 && !k10) LogConditions("F10");
-		k6 = n6; k7 = n7; k8 = n8; k9 = n9; k10 = n10;
+		if (n10 && !k10) { LogConditions("F10"); LogRegisteredRaw("F10"); }
+		if (n11 && !k11) ToggleOpenClamp();
+		k6 = n6; k7 = n7; k8 = n8; k9 = n9; k10 = n10; k11 = n11;
 
 		if (now >= nextSec) { nextSec += 1000.0; PrintSecond(); }
 	}
