@@ -48,7 +48,9 @@
 //  9. Звук: F7 - 1 писк, F8 - 2 писка, F9 - 1/2/3 писка (PASS/RAW/ZERO), ошибка - низкий тон.
 //
 // Хоткеи (работают, только когда окно игры в фокусе):
-//   F4 - (v4.3) обход сглаживателя yaw/pitch контроллера камеры (нужны tracer role=ctrl/camblock/apply)
+//   F3 - (v4.4) ловец писателей: вкл/выкл аппаратные точки останова из ключей WatchN в cfg (кто пишет/читает поле)
+//   F4 - (v4.3) обход сглаживателя yaw/pitch контроллера камеры (нужны tracer role=ctrl/camblock/apply);
+//        v4.4: диагностика записи (счётчики, значения до/после, "затёрто ли" на следующем кадре)
 //   F5 - (v4.2) метка "вижу рикошёт сейчас" в захвате
 //   F6 - маркер + таблица "кто вызывает user32"    F7/F8 - начало/конец захвата (CSV + итоги в лог)
 //   F9 - режим (см. B выше)                        F10   - условия опыта + список зарегистрированных raw-устройств
@@ -62,6 +64,7 @@
 #define NOMINMAX
 #include <Windows.h>
 #include <wincrypt.h>
+#include <TlHelp32.h>
 #include <intrin.h>
 
 #include <algorithm>
@@ -90,10 +93,11 @@
 #ifndef DS3PROBE_GIT_SHA
 #define DS3PROBE_GIT_SHA "unknown"
 #endif
-#define DS3PROBE_VERSION "v4.3"
+#define DS3PROBE_VERSION "v4.4"
 
 namespace opt
 {
+	constexpr int kVkWatch  = VK_F3;   // v4.4: вкл/выкл ловец писателей (аппаратные точки останова)
 	constexpr int kVkFollow = VK_F4;   // v4.3: вкл/выкл обход сглаживателя yaw/pitch контроллера (опыт "follower bypass")
 	constexpr int kVkBounce = VK_F5;   // v4.2: "вижу рикошёт прямо сейчас" - метка времени в захвате
 	constexpr int kVkMarker = VK_F6;
@@ -334,6 +338,7 @@ struct CfgAddr  { bool set = false; uintptr_t v = 0; };
 struct CfgBytes { bool set = false; std::string v; };
 struct TraceCfg { CfgAddr addr; CfgBytes bytes; std::string name; int args = 6; int thisDwords = 8; int base = 0; std::vector<uint32_t> fields;
 	int dumpOff = 0; int dumpLen = 0; int dumpFrom = 0; int role = 0; }; // v4.2: dump = смещение (hex, может быть со знаком) и длина в байтах; dumpfrom = номер трассировщика, чей base брать за указатель (0 = свой)
+struct WatchCfg { bool set = false; int base = 0; uint32_t off = 0; int rw = 1; }; // v4.4: base 0=abs 1=ctrl 2=camblock; rw 1=запись, 3=чтение+запись
 struct Config
 {
 	std::wstring file;           // какой файл прочитан
@@ -343,6 +348,7 @@ struct Config
 	double rawScale = 1.0;                       // не используется с v4 (RAW убран), ключ принимается для совместимости
 	double diScale[3] = { 0.5, 0.25, 2.0 };      // множители режимов DI-xA / DI-xB / DI-xC
 	TraceCfg trace[opt::kMaxTracers];
+	WatchCfg watch[4];
 	uintptr_t offSens = 0x17C, offMouseState = 0x18C;
 	CfgAddr mgs, poll, wnd, mapper, accDX, accDY, flagCap, flagRc, virtW, virtH, mgrPtr, stickVirt, stickSmooth;
 	CfgBytes bMgs, bPoll, bWnd, bMapper, bStickVirt, bStickSmooth;
@@ -576,6 +582,19 @@ static void LoadConfig()
 		else if (k == "rawscale") { double d = 0; if (ParseDouble(v, &d) && d > 0.0 && d < 100.0) g_cfg.rawScale = d; else CfgErr(ln, k, "expected a number in (0,100)"); }
 		else if (k == "offsens") { uintptr_t n = 0; if (ParseHex32(v, &n) && n < 0x10000) g_cfg.offSens = n; else CfgErr(ln, k, "expected hex offset < 0x10000"); }
 		else if (k == "offmousestate") { uintptr_t n = 0; if (ParseHex32(v, &n) && n < 0x10000) g_cfg.offMouseState = n; else CfgErr(ln, k, "expected hex offset < 0x10000"); }
+		else if (k.size() == 6 && k.compare(0, 5, "watch") == 0 && k[5] >= '1' && k[5] <= '4')
+		{
+			// WatchN = <abs|ctrl|camblock> <hex offset (для abs - полный адрес)> <w|rw>
+			std::istringstream is(v);
+			std::string b, o, m;
+			is >> b >> o >> m;
+			uintptr_t off = 0;
+			WatchCfg w;
+			b = Lower(b); m = Lower(m);
+			if (b == "abs") w.base = 0; else if (b == "ctrl") w.base = 1; else if (b == "camblock") w.base = 2; else w.base = -1;
+			if (w.base < 0 || !ParseHex32(o, &off) || (m != "w" && m != "rw") || (off & 3u)) CfgErr(ln, k, "expected '<abs|ctrl|camblock> <hex offset multiple of 4> <w|rw>', e.g. ctrl 44 w");
+			else { w.set = true; w.off = (uint32_t)off; w.rw = (m == "w") ? 1 : 3; g_cfg.watch[k[5] - '1'] = w; }
+		}
 		else
 		{
 			int ti = 0;
@@ -929,18 +948,246 @@ static TraceState g_trace[opt::kMaxTracers];
 static std::atomic<bool> g_followFix{ false };
 static std::atomic<uint32_t> g_ctrlPtr{ 0 }, g_camBlk{ 0 };
 static std::atomic<uint64_t> g_followApplied{ 0 };
+// v4.4: диагностика F4. Видно: дошла ли запись, что стояло ДО неё (отстающее значение), прочиталось ли записанное сразу,
+// и осталось ли оно нетронутым к началу следующего LookUpdate (kept) или перезаписано (clobbered).
+static std::atomic<uint64_t> g_fxCalls{ 0 }, g_fxSkipPtr{ 0 }, g_fxSkipRange{ 0 }, g_fxWriteFail{ 0 }, g_fxReadbackBad{ 0 };
+static std::atomic<uint64_t> g_fxKept{ 0 }, g_fxClobbered{ 0 };
+static std::atomic<uint32_t> g_fxLastPitchBits{ 0 }, g_fxLastYawBits{ 0 };
+static std::atomic<bool> g_fxHaveLast{ false };
+static std::atomic<float> g_fxPreErrYaw{ 0.0f };    // |yaw до записи - цель|, последняя запись, рад
+static std::atomic<float> g_fxClobberYaw{ 0.0f };   // |yaw на входе LookUpdate - записанный|, последняя "затёртая", рад
+static std::atomic<uint64_t> g_ctrlCalls{ 0 };      // номер кадра (счётчик входов в LookUpdate)
+static uint32_t FBits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+static float WrapPi(float a) { while (a > 3.14159265f) a -= 6.28318531f; while (a < -3.14159265f) a += 6.28318531f; return a; }
 static void ApplyFollowFix()
 {
+	g_fxCalls.fetch_add(1, std::memory_order_relaxed);
 	const uint32_t c = g_ctrlPtr.load(), b = g_camBlk.load();
-	if (!PlausiblePtr(c) || !PlausiblePtr(b)) return;
+	if (!PlausiblePtr(c) || !PlausiblePtr(b)) { g_fxSkipPtr.fetch_add(1, std::memory_order_relaxed); return; }
 	float pitch = 0, m12 = 0, m14 = 0;
-	if (!ReadT((uintptr_t)b, &pitch) || !ReadT((uintptr_t)b + 0x10, &m12) || !ReadT((uintptr_t)b + 0x18, &m14)) return;
-	if (!(std::fabs(pitch) < 3.2f) || !(std::fabs(m12) <= 1.001f) || !(std::fabs(m14) <= 1.001f)) return;
+	if (!ReadT((uintptr_t)b, &pitch) || !ReadT((uintptr_t)b + 0x10, &m12) || !ReadT((uintptr_t)b + 0x18, &m14)) { g_fxSkipPtr.fetch_add(1, std::memory_order_relaxed); return; }
+	if (!(std::fabs(pitch) < 3.2f) || !(std::fabs(m12) <= 1.001f) || !(std::fabs(m14) <= 1.001f)) { g_fxSkipRange.fetch_add(1, std::memory_order_relaxed); return; }
 	float yaw = std::atan2(m12, m14) - 1.57079632679f;
 	if (yaw < -3.14159265f) yaw += 6.28318531f;
-	WriteT((uintptr_t)c + 0x40, pitch);
-	WriteT((uintptr_t)c + 0x44, yaw);
+	float preYaw = 0;
+	if (ReadT((uintptr_t)c + 0x44, &preYaw)) g_fxPreErrYaw.store(std::fabs(WrapPi(yaw - preYaw)), std::memory_order_relaxed);
+	if (!WriteT((uintptr_t)c + 0x40, pitch) || !WriteT((uintptr_t)c + 0x44, yaw)) { g_fxWriteFail.fetch_add(1, std::memory_order_relaxed); return; }
+	float rbP = 0, rbY = 0;
+	if (!ReadT((uintptr_t)c + 0x40, &rbP) || !ReadT((uintptr_t)c + 0x44, &rbY) || FBits(rbP) != FBits(pitch) || FBits(rbY) != FBits(yaw)) g_fxReadbackBad.fetch_add(1, std::memory_order_relaxed);
+	g_fxLastPitchBits.store(FBits(pitch), std::memory_order_relaxed);
+	g_fxLastYawBits.store(FBits(yaw), std::memory_order_relaxed);
+	g_fxHaveLast.store(true, std::memory_order_relaxed);
 	g_followApplied.fetch_add(1, std::memory_order_relaxed);
+}
+// вызывается на входе LookUpdate (role=ctrl): осталось ли записанное F4 значение нетронутым с прошлого кадра
+static void FollowFixCheckKept(uint32_t ctrl)
+{
+	if (!g_fxHaveLast.load(std::memory_order_relaxed) || !PlausiblePtr(ctrl)) return;
+	float y = 0;
+	if (!ReadT((uintptr_t)ctrl + 0x44, &y)) return;
+	if (FBits(y) == g_fxLastYawBits.load(std::memory_order_relaxed)) g_fxKept.fetch_add(1, std::memory_order_relaxed);
+	else
+	{
+		g_fxClobbered.fetch_add(1, std::memory_order_relaxed);
+		g_fxClobberYaw.store(std::fabs(WrapPi(y - BitsToF(g_fxLastYawBits.load(std::memory_order_relaxed)))), std::memory_order_relaxed);
+	}
+}
+static void LogFollowFixStats(const char* tag)
+{
+	Log("F4 stats (%s): on=%d calls=%llu applied=%llu skipPtr=%llu skipRange=%llu writeFail=%llu readbackBad=%llu | next-frame kept=%llu clobbered=%llu | last pre-write |yaw-target|=%.2f deg, last clobber |dyaw|=%.3f deg",
+		tag, (int)g_followFix.load(), (unsigned long long)g_fxCalls.load(), (unsigned long long)g_followApplied.load(), (unsigned long long)g_fxSkipPtr.load(),
+		(unsigned long long)g_fxSkipRange.load(), (unsigned long long)g_fxWriteFail.load(), (unsigned long long)g_fxReadbackBad.load(),
+		(unsigned long long)g_fxKept.load(), (unsigned long long)g_fxClobbered.load(), (double)g_fxPreErrYaw.load() * 57.29578, (double)g_fxClobberYaw.load() * 57.29578);
+}
+
+// ----------------------------------------------------------------------------
+// v4.4: ловец писателей. Аппаратные точки останова (DR0..DR3) на поля объекта-контроллера / блока камеры: кто пишет
+// (или читает) эти слова. Результат - адреса инструкций (exe+..., ghidra ...) и стек вызовов. F3 вкл/выкл.
+// Точки ставятся на все потоки процесса (кроме нашего), перевзвод раз в ~1 с (на случай переезда объектов и новых потоков).
+// ----------------------------------------------------------------------------
+struct WatchHit
+{
+	std::atomic<uint32_t> eip{ 0 };       // публикуется последним; 0 = слот свободен
+	int watch = 0;                        // 0..3
+	uint32_t tid = 0, val = 0, stk[6] = {};
+	uint64_t firstFrame = 0, lastFrame = 0;
+	std::atomic<uint64_t> count{ 0 };
+};
+static WatchHit g_hits[64];
+static std::atomic<int> g_hitN{ 0 };
+static std::atomic<bool> g_watchOn{ false };
+static std::atomic<uint32_t> g_watchAddr[4] = {};   // реально взведённые адреса (для разбора в обработчике)
+static PVOID g_vehHandle = nullptr;
+
+static LONG CALLBACK WatchVeh(PEXCEPTION_POINTERS ep)
+{
+	if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+	CONTEXT* c = ep->ContextRecord;
+	const DWORD dr6 = c->Dr6;
+	if (!(dr6 & 0xF)) return EXCEPTION_CONTINUE_SEARCH; // не наша ловушка
+	const uint32_t eip = (uint32_t)c->Eip;
+	for (int i = 0; i < 4; ++i)
+	{
+		if (!(dr6 & (1u << i))) continue;
+		WatchHit* h = nullptr;
+		const int n = g_hitN.load(std::memory_order_acquire);
+		for (int k = 0; k < n && k < 64; ++k)
+			if (g_hits[k].eip.load(std::memory_order_acquire) == eip && g_hits[k].watch == i) { h = &g_hits[k]; break; }
+		const uint64_t fr = g_ctrlCalls.load(std::memory_order_relaxed);
+		uint32_t val = 0;
+		const uint32_t a = g_watchAddr[i].load(std::memory_order_relaxed);
+		if (a) ReadT((uintptr_t)a, &val);
+		if (!h)
+		{
+			const int idx = g_hitN.fetch_add(1, std::memory_order_acq_rel);
+			if (idx >= 64) { g_hitN.store(64); continue; }
+			h = &g_hits[idx];
+			h->watch = i; h->tid = GetCurrentThreadId(); h->firstFrame = fr;
+			int got = 0;
+			for (int q = 0; q < 64 && got < 6; ++q)
+			{
+				uint32_t v = 0;
+				if (!ReadT((uintptr_t)c->Esp + 4u * q, &v)) break;
+				if (InImage(v)) h->stk[got++] = v;
+			}
+			h->eip.store(eip, std::memory_order_release);
+		}
+		h->lastFrame = fr; h->val = val;
+		h->count.fetch_add(1, std::memory_order_relaxed);
+	}
+	c->Dr6 = 0;
+	return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static bool SetDebugRegsOnThread(DWORD tid, const uint32_t addr[4], const int rw[4])
+{
+	HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+	if (!h) return false;
+	bool ok = false;
+	if (SuspendThread(h) != (DWORD)-1) // между Suspend и Resume не выделяем память и не пишем в лог (возможна блокировка)
+	{
+		CONTEXT c = {};
+		c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+		if (GetThreadContext(h, &c))
+		{
+			DWORD dr7 = 0;
+			DWORD* regs[4] = { &c.Dr0, &c.Dr1, &c.Dr2, &c.Dr3 };
+			for (int i = 0; i < 4; ++i)
+			{
+				*regs[i] = addr[i];
+				if (addr[i]) dr7 |= (1u << (2 * i)) | ((DWORD)rw[i] << (16 + 4 * i)) | (3u << (18 + 4 * i));
+			}
+			c.Dr6 = 0;
+			c.Dr7 = dr7;
+			ok = SetThreadContext(h, &c) != 0;
+		}
+		ResumeThread(h);
+	}
+	CloseHandle(h);
+	return ok;
+}
+
+// ставит (addr != 0) или снимает (все 0) точки на всех потоках, кроме текущего; возвращает число успешных потоков
+static int SetDebugRegsAllThreads(const uint32_t addr[4], const int rw[4], int* total)
+{
+	int okN = 0, all = 0;
+	const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	if (snap != INVALID_HANDLE_VALUE)
+	{
+		THREADENTRY32 te = {};
+		te.dwSize = sizeof(te);
+		for (BOOL r = Thread32First(snap, &te); r; r = Thread32Next(snap, &te))
+		{
+			if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+			++all;
+			if (SetDebugRegsOnThread(te.th32ThreadID, addr, rw)) ++okN;
+		}
+		CloseHandle(snap);
+	}
+	if (total) *total = all;
+	return okN;
+}
+
+static int g_watchLogged = 0;          // сколько записей g_hits уже выведено в лог (первое появление)
+static uint32_t g_watchArmedAddr[4] = {};
+static int g_watchArmedRw[4] = {};
+
+static uint32_t WatchResolve(int i)
+{
+	const WatchCfg& w = g_cfg.watch[i];
+	if (!w.set) return 0;
+	uint32_t base = 0;
+	if (w.base == 1) base = g_ctrlPtr.load(); else if (w.base == 2) base = g_camBlk.load();
+	if (w.base != 0 && !PlausiblePtr(base)) return 0;
+	const uint32_t a = base + w.off;
+	return (PlausiblePtr(a) && !(a & 3u)) ? a : 0;
+}
+
+// (пере)взвод по текущим указателям; вызывается из рабочего потока
+static void WatchRearm(bool force, const char* why)
+{
+	uint32_t addr[4] = {}; int rw[4] = {};
+	bool any = false, changed = force;
+	for (int i = 0; i < 4; ++i)
+	{
+		addr[i] = WatchResolve(i); rw[i] = g_cfg.watch[i].rw;
+		if (addr[i]) any = true;
+		if (addr[i] != g_watchArmedAddr[i]) changed = true;
+	}
+	if (!changed) return;
+	if (!g_vehHandle) g_vehHandle = AddVectoredExceptionHandler(1, &WatchVeh);
+	for (int i = 0; i < 4; ++i) g_watchAddr[i].store(addr[i], std::memory_order_relaxed);
+	int total = 0;
+	const int ok = SetDebugRegsAllThreads(addr, rw, &total);
+	memcpy(g_watchArmedAddr, addr, sizeof(addr)); memcpy(g_watchArmedRw, rw, sizeof(rw));
+	Log("watch: %s -> %d/%d threads armed; DR0..3 = %08X %08X %08X %08X%s", why, ok, total, (unsigned)addr[0], (unsigned)addr[1], (unsigned)addr[2], (unsigned)addr[3], any ? "" : " (no addresses resolved yet: need roles ctrl/camblock and WatchN keys)");
+}
+
+static void WatchFlushLog(bool summary)
+{
+	const int n = std::min(g_hitN.load(std::memory_order_acquire), 64);
+	for (int k = 0; k < n; ++k)
+	{
+		WatchHit& h = g_hits[k];
+		const uint32_t eip = h.eip.load(std::memory_order_acquire);
+		if (!eip) continue;
+		if (!summary && k < g_watchLogged) continue;
+		char b[512];
+		std::string s;
+		for (int q = 0; q < 6 && h.stk[q]; ++q) { snprintf(b, sizeof(b), " %s", Where(reinterpret_cast<void*>((uintptr_t)h.stk[q])).c_str()); s += b; }
+		const WatchCfg& w = g_cfg.watch[h.watch];
+		Log("watch%s W%d (%s %s+0x%X) eip=%s tid=%u count=%llu frames=%llu..%llu lastvalue=%08X(%.6g) stack(exe):%s", summary ? "-summary" : "-new", h.watch + 1, w.rw == 1 ? "write" : "read/write",
+			w.base == 1 ? "ctrl" : (w.base == 2 ? "camblock" : "abs"), (unsigned)w.off, Where(reinterpret_cast<void*>((uintptr_t)eip)).c_str(), (unsigned)h.tid,
+			(unsigned long long)h.count.load(), (unsigned long long)h.firstFrame, (unsigned long long)h.lastFrame, (unsigned)h.val, (double)BitsToF(h.val), s.c_str());
+	}
+	if (!summary) g_watchLogged = n;
+}
+
+static void WatchToggle()
+{
+	if (!g_watchOn.load())
+	{
+		bool any = false;
+		for (int i = 0; i < 4; ++i) any = any || g_cfg.watch[i].set;
+		if (!any) { Log("=== F3: no Watch1..Watch4 keys in cfg -> nothing to arm ==="); return; }
+		g_watchOn.store(true);
+		memset(g_watchArmedAddr, 0, sizeof(g_watchArmedAddr));
+		Log("=== F3: writer catcher ON ===");
+		WatchRearm(true, "arm");
+	}
+	else
+	{
+		g_watchOn.store(false);
+		const uint32_t z[4] = {}; const int rz[4] = {};
+		for (int i = 0; i < 4; ++i) g_watchAddr[i].store(0);
+		int total = 0;
+		const int ok = SetDebugRegsAllThreads(z, rz, &total);
+		memset(g_watchArmedAddr, 0, sizeof(g_watchArmedAddr));
+		Log("=== F3: writer catcher OFF (%d/%d threads cleared) ===", ok, total);
+		WatchFlushLog(false);
+		WatchFlushLog(true);
+	}
 }
 static SafetyHookMid g_traceHooks[opt::kMaxTracers];
 
@@ -966,7 +1213,7 @@ static void OnTrace(int id, safetyhook::Context& ctx)
 	const uint32_t ecx = (uint32_t)ctx.ecx, edx = (uint32_t)ctx.edx, esp = (uint32_t)ctx.esp, eax = (uint32_t)ctx.eax;
 	const uint32_t bv = CtxReg(ctx, ts.base);
 	ts.lastBase.store(bv, std::memory_order_relaxed);
-	if (ts.role == 1) g_ctrlPtr.store(bv, std::memory_order_relaxed);
+	if (ts.role == 1) { g_ctrlPtr.store(bv, std::memory_order_relaxed); g_ctrlCalls.fetch_add(1, std::memory_order_relaxed); if (g_followFix.load(std::memory_order_relaxed)) FollowFixCheckKept(bv); }
 	else if (ts.role == 2) g_camBlk.store(bv, std::memory_order_relaxed);
 	else if (ts.role == 3 && g_followFix.load(std::memory_order_relaxed)) ApplyFollowFix();
 	uint32_t ra = 0, a[8] = {}, th[16] = {}, fv[16] = {};
@@ -1359,6 +1606,13 @@ static void StartCapture()
 			}
 			g_capMeta += "\n";
 		} }
+	{
+		std::string rl;
+		for (int i = 0; i < opt::kMaxTracers; ++i)
+			if (g_trace[i].on && g_trace[i].role) { snprintf(b, sizeof(b), " trace%d=%s", i + 1, g_trace[i].role == 1 ? "ctrl" : (g_trace[i].role == 2 ? "camblock" : "apply")); rl += b; }
+		g_capMeta += "# roles:" + (rl.empty() ? std::string(" (none)") : rl) + "\n";
+		snprintf(b, sizeof(b), "# pointers ctrl=%08X camblock=%08X watch_on=%d\n", (unsigned)g_ctrlPtr.load(), (unsigned)g_camBlk.load(), (int)g_watchOn.load()); g_capMeta += b;
+	}
 	snprintf(b, sizeof(b), "# followfix=%d (F4 follower bypass; 1 = controller yaw/pitch forced to target each frame)\n", (int)g_followFix.load()); g_capMeta += b;
 	g_capMeta += "# conditions: " + cond + "\n";
 
@@ -1607,6 +1861,14 @@ static void StopCapture()
 		snprintf(b, sizeof(b), "# raw_reference=%s raw_events_in_capture=%llu last_raw_event_age_s=%.1f\n", alive ? "alive" : "DEAD", (unsigned long long)ev,
 			last >= 0 ? (NowMs() - last) / 1000.0 : -1.0);
 		g_capMetaTail = b;
+		{
+			char f4[400];
+			snprintf(f4, sizeof(f4), "# f4_stats on=%d calls=%llu applied=%llu skipPtr=%llu skipRange=%llu writeFail=%llu readbackBad=%llu kept=%llu clobbered=%llu (whole run, not per capture)\n",
+				(int)g_followFix.load(), (unsigned long long)g_fxCalls.load(), (unsigned long long)g_followApplied.load(), (unsigned long long)g_fxSkipPtr.load(), (unsigned long long)g_fxSkipRange.load(),
+				(unsigned long long)g_fxWriteFail.load(), (unsigned long long)g_fxReadbackBad.load(), (unsigned long long)g_fxKept.load(), (unsigned long long)g_fxClobbered.load());
+			g_capMetaTail += f4;
+		}
+		LogFollowFixStats("capture stop");
 		Log("  raw reference: %s", b + 2);
 	}
 	LogRegisteredRaw("capture stop");
@@ -2166,7 +2428,7 @@ static DWORD WINAPI WorkerThread(LPVOID)
 
 	const double t0 = NowMs();
 	double nextSec = t0 + 1000.0, d3d9Seen = -1.0;
-	bool k4 = false, k5 = false, k6 = false, k7 = false, k8 = false, k9 = false, k10 = false, k11 = false;
+	bool k3 = false, k4 = false, k5 = false, k6 = false, k7 = false, k8 = false, k9 = false, k10 = false, k11 = false;
 	int marker = 0;
 
 	for (;;)
@@ -2184,16 +2446,19 @@ static DWORD WINAPI WorkerThread(LPVOID)
 		if (g_mode.load() != M_PASS && now - g_modeSince.load() > opt::kModeAutoRevertMs) { SetMode(M_PASS, "auto-revert after 2 min"); Tone(1, 300); }
 
 		const bool fg = GameFocused();
+		const bool n3 = fg && KeyDown(opt::kVkWatch);
 		const bool n4 = fg && KeyDown(opt::kVkFollow);
 		const bool n5 = fg && KeyDown(opt::kVkBounce);
 		const bool n6 = fg && KeyDown(opt::kVkMarker), n7 = fg && KeyDown(opt::kVkStart), n8 = fg && KeyDown(opt::kVkStop);
 		const bool n9 = fg && KeyDown(opt::kVkMode), n10 = fg && KeyDown(opt::kVkInfo), n11 = fg && KeyDown(opt::kVkOpen);
+		if (n3 && !k3) { WatchToggle(); Tone(g_watchOn.load() ? 2 : 1, g_watchOn.load() ? 1300 : 500); }
 		if (n4 && !k4)
 		{
 			const bool on = !g_followFix.load();
 			g_followFix.store(on);
 			Log("=== F4: follower bypass %s (ctrl=%08X camblock=%08X applied so far=%llu) ===", on ? "ON" : "OFF", (unsigned)g_ctrlPtr.load(), (unsigned)g_camBlk.load(), (unsigned long long)g_followApplied.load());
 			if (on && (!g_ctrlPtr.load() || !g_camBlk.load())) Log("  F4: pointers not known yet (need tracers with role=ctrl and role=camblock, and role=apply) - nothing will be written");
+			if (!on) LogFollowFixStats("F4 off");
 			Tone(on ? 2 : 1, on ? 1500 : 500);
 		}
 		if (n5 && !k5)
@@ -2213,9 +2478,17 @@ static DWORD WINAPI WorkerThread(LPVOID)
 		if (n9 && !k9) CycleMode();
 		if (n10 && !k10) { LogConditions("F10"); LogRegisteredRaw("F10"); }
 		if (n11 && !k11) ToggleOpenClamp();
-		k4 = n4; k5 = n5; k6 = n6; k7 = n7; k8 = n8; k9 = n9; k10 = n10; k11 = n11;
+		k3 = n3; k4 = n4; k5 = n5; k6 = n6; k7 = n7; k8 = n8; k9 = n9; k10 = n10; k11 = n11;
 
-		if (now >= nextSec) { nextSec += 1000.0; PrintSecond(); }
+		if (now >= nextSec)
+		{
+			nextSec += 1000.0;
+			PrintSecond();
+			static int sec = 0;
+			++sec;
+			if (g_watchOn.load()) { WatchRearm(false, "re-arm (pointers changed)"); WatchFlushLog(false); if (sec % 10 == 0) WatchFlushLog(true); }
+			if (g_followFix.load() && sec % 5 == 0) LogFollowFixStats("periodic");
+		}
 	}
 }
 

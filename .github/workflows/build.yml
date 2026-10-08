@@ -19,6 +19,13 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
 
+      - name: Python self-tests (analyzers)
+        env:
+          PYTHONUTF8: "1"
+        run: |
+          python tests/test_analyze_di.py
+          python tests/test_analyze_follow.py
+
       - name: Upload dinput8.dll
         uses: actions/upload-artifact@v4
         with:
@@ -29,3 +36,4 @@ jobs:
             ds3probe.cfg.example
             ds3probe_camdump.cfg.example
             tools/analyze_di.py
+            tools/analyze_follow.py

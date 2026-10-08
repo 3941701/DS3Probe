@@ -1,4 +1,4 @@
-# DS3Probe v4.2 - cfg для опыта "где рикошёт": дампы памяти объекта камеры + знакомые трассировщики.
+# DS3Probe v4.4 - cfg для опыта "где рикошёт": дампы памяти объекта камеры + знакомые трассировщики.
 # Положи рядом с deadspace3.exe под именем ds3probe.cfg (старый cfg сохрани под другим именем).
 # Байты взяты из Приложения A отчёта (база Ghidra 1.0.0.1).
 MD5 = 1802f17a2cc1c2797323632862c6fb1f
@@ -58,3 +58,12 @@ Trace8.base = edi
 Trace8.this = 3
 Trace8.dump = -20 300
 Trace8.role = camblock
+
+# ---- v4.4: ловец писателей (F3 вкл/выкл). Аппаратные точки останова на слова объектов; результат - в ds3probe.log
+# строки "watch-new/watch-summary": адрес инструкции (exe+..., ghidra ...) и стек вызовов.
+# Формат:  WatchN = <ctrl|camblock|abs> <hex смещение, кратное 4> <w|rw>     (N = 1..4; для abs - полный адрес)
+# ctrl = объект LookUpdate (role=ctrl), camblock = cam+0x20 (role=camblock).
+Watch1 = ctrl 44 w
+Watch2 = ctrl 20 w
+Watch3 = ctrl 40 w
+Watch4 = camblock 10 rw
