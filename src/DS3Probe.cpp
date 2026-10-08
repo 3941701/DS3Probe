@@ -88,7 +88,7 @@
 #ifndef DS3PROBE_GIT_SHA
 #define DS3PROBE_GIT_SHA "unknown"
 #endif
-#define DS3PROBE_VERSION "v4"
+#define DS3PROBE_VERSION "v4.1"
 
 namespace opt
 {
@@ -326,7 +326,7 @@ static const Profile kProfiles[] =
 
 struct CfgAddr  { bool set = false; uintptr_t v = 0; };
 struct CfgBytes { bool set = false; std::string v; };
-struct TraceCfg { CfgAddr addr; CfgBytes bytes; std::string name; int args = 6; int thisDwords = 8; };
+struct TraceCfg { CfgAddr addr; CfgBytes bytes; std::string name; int args = 6; int thisDwords = 8; int base = 0; std::vector<uint32_t> fields; };
 struct Config
 {
 	std::wstring file;           // какой файл прочитан
@@ -392,6 +392,37 @@ static bool ParseInt(const std::string& s, int lo, int hi, int* out)
 	*out = (int)v;
 	return true;
 }
+// имя регистра -> индекс 0..7 (ecx, edx, eax, ebx, esi, edi, ebp, esp); -1 = не распознано
+static const char* const kRegNames[8] = { "ecx", "edx", "eax", "ebx", "esi", "edi", "ebp", "esp" };
+static int RegIndex(const std::string& v)
+{
+	const std::string s = Lower(v);
+	for (int i = 0; i < 8; ++i) if (s == kRegNames[i]) return i;
+	return -1;
+}
+// "70 150,158 C8" -> {0x70,0x150,0x158,0xC8}; до 16 смещений (hex, < 0x10000)
+static bool ParseOffsets(const std::string& v, std::vector<uint32_t>* out)
+{
+	out->clear();
+	std::string cur;
+	auto flush = [&]() -> bool
+	{
+		if (cur.empty()) return true;
+		uintptr_t n = 0;
+		if (!ParseHex32(cur, &n) || n >= 0x10000 || out->size() >= 16) return false;
+		out->push_back((uint32_t)n);
+		cur.clear();
+		return true;
+	};
+	for (char c : v)
+	{
+		if (c == ' ' || c == ',' || c == '\t') { if (!flush()) return false; }
+		else cur += c;
+	}
+	if (!flush()) return false;
+	return !out->empty();
+}
+
 // "trace3" / "trace3.bytes" / "trace3.name" ... -> индекс 0..kMaxTracers-1 и суффикс после точки (может быть пустым)
 static bool ParseTraceKey(const std::string& k, int* idx, std::string* sub)
 {
@@ -527,7 +558,17 @@ static void LoadConfig()
 			else if (sub == "name") g_cfg.trace[ti].name = v.substr(0, 40);
 			else if (sub == "args") { int n = 0; if (ParseInt(v, 0, 8, &n)) g_cfg.trace[ti].args = n; else CfgErr(ln, k, "expected an integer 0..8"); }
 			else if (sub == "this") { int n = 0; if (ParseInt(v, 0, 16, &n)) g_cfg.trace[ti].thisDwords = n; else CfgErr(ln, k, "expected an integer 0..16"); }
-			else CfgErr(ln, k, "unknown trace sub-key (bytes|name|args|this)");
+			else if (sub == "base")
+			{
+				int b = RegIndex(v);
+				if (b >= 0) g_cfg.trace[ti].base = b; else CfgErr(ln, k, "expected a register: ecx|edx|eax|ebx|esi|edi|ebp|esp");
+			}
+			else if (sub == "fields")
+			{
+				std::vector<uint32_t> f;
+				if (ParseOffsets(v, &f)) g_cfg.trace[ti].fields = f; else CfgErr(ln, k, "expected up to 16 hex offsets (each < 0x10000), separated by spaces or commas");
+			}
+			else CfgErr(ln, k, "unknown trace sub-key (bytes|name|args|this|base|fields)");
 		}
 	}
 	Log("cfg: parsed, %d error(s)%s", g_cfg.errors, g_cfg.errors ? " -> exe hooks will NOT be installed until the cfg is fixed" : "");
@@ -715,14 +756,17 @@ static std::unordered_map<uintptr_t, float> g_clampOrig;      // исходны�
 // (поля только читаются; единственная запись - this[3] в режиме F11).
 // ----------------------------------------------------------------------------
 struct VRec { double t; uint32_t arg0, id; uint8_t active; float x, y, accx, accy; };
-struct SRec { double t; float dt, xin, yin, xout, yout; uint32_t id; float win, blend, clamp; uint8_t active; float w[8]; uint32_t ret; };
-struct TraceRec { double t; uint8_t id; uint32_t ecx, edx, ra; uint32_t a[8]; uint32_t th[16]; };
+struct SRec { double t; float dt, xin, yin, xout, yout; uint32_t id; float win, blend, clamp; uint8_t active; float w[8]; uint32_t ret; uint32_t caller; };
+struct TraceRec { double t; uint8_t id; uint32_t ecx, edx, ra, eax, bv; uint32_t a[8]; uint32_t th[16]; uint32_t f[16]; };
 
 static std::mutex g_stickMu;
 static std::vector<VRec> g_recV;
 static std::vector<SRec> g_recS;
 static std::vector<TraceRec> g_recT;
-static std::atomic<bool> g_openClamp{ false };
+// v4.1: F11 - лестница клэмпа this[3] FUN_0040D820: 0 = исходное значение (2.0), 1..4 = ступени kClampLadder (последняя = практически без клэмпа)
+static std::atomic<int> g_openClamp{ 0 };
+static const float kClampLadder[] = { 6.0f, 12.0f, 24.0f, 1.0e9f };
+static const int kClampSteps = (int)(sizeof(kClampLadder) / sizeof(kClampLadder[0]));
 static safetyhook::InlineHook hkStickVirt, hkStickSmooth;
 // максимумы за секунду для сводки (пишет поток игры, читает поток пробы; гонка безвредна)
 static std::atomic<float> g_vMaxX{ 0 }, g_vMaxY{ 0 }, g_vMaxLen{ 0 }, g_sMaxX{ 0 }, g_sMaxY{ 0 };
@@ -760,13 +804,14 @@ static void OnStickVirt(void* self, uint32_t arg0, const float* x, const float* 
 	if (g_recV.size() < opt::kMaxRecs) g_recV.push_back(r);
 }
 
-static void OnStickSmooth(void* self, float dt, float xin, float yin, const float* x, const float* y, uint32_t ret)
+static void OnStickSmooth(void* self, float dt, float xin, float yin, const float* x, const float* y, uint32_t ret, void* caller)
 {
 	Count(C_StickSmooth);
 	const uintptr_t s = reinterpret_cast<uintptr_t>(self);
 	SRec r = {};
 	r.t = NowMs() - g_capStart;
-	r.dt = dt; r.xin = xin; r.yin = yin; r.ret = ret;
+	r.dt = dt; r.xin = xin; r.yin = yin; r.ret = ret; r.caller = (uint32_t)reinterpret_cast<uintptr_t>(caller);
+	NoteCaller(C_StickSmooth, caller);
 	ReadT(reinterpret_cast<uintptr_t>(x), &r.xout);
 	ReadT(reinterpret_cast<uintptr_t>(y), &r.yout);
 	ReadT(s, &r.id);
@@ -778,9 +823,9 @@ static void OnStickSmooth(void* self, float dt, float xin, float yin, const floa
 	if (FiniteF(r.xout, 1.0e9f)) MaxF(g_sMaxX, std::fabs(r.xout));
 	if (FiniteF(r.yout, 1.0e9f)) MaxF(g_sMaxY, std::fabs(r.yout));
 	if (FirstN(C_StickSmooth))
-		Log("StickSmooth(FUN_0040D820): this=%08X dt=%.5f in=(%.5f,%.5f) out=(%.5f,%.5f) id=%u win=%.4f blend=%.4f clamp=%.4f active=%u ret=%08X cur=(%.3f,%.3f,%.3f,%.3f) prev=(%.3f,%.3f,%.3f,%.3f)",
+		Log("StickSmooth(FUN_0040D820): this=%08X dt=%.5f in=(%.5f,%.5f) out=(%.5f,%.5f) id=%u win=%.4f blend=%.4f clamp=%.4f active=%u retval=%08X caller=%s cur=(%.3f,%.3f,%.3f,%.3f) prev=(%.3f,%.3f,%.3f,%.3f)",
 			(unsigned)s, (double)dt, (double)xin, (double)yin, (double)r.xout, (double)r.yout, (unsigned)r.id, (double)r.win, (double)r.blend, (double)r.clamp,
-			(unsigned)r.active, (unsigned)ret, (double)r.w[0], (double)r.w[1], (double)r.w[2], (double)r.w[3], (double)r.w[4], (double)r.w[5], (double)r.w[6], (double)r.w[7]);
+			(unsigned)r.active, (unsigned)ret, Where(caller).c_str(), (double)r.w[0], (double)r.w[1], (double)r.w[2], (double)r.w[3], (double)r.w[4], (double)r.w[5], (double)r.w[6], (double)r.w[7]);
 	if (!g_capturing.load()) return;
 	std::lock_guard<std::mutex> lk(g_stickMu);
 	if (g_recS.size() < opt::kMaxRecs) g_recS.push_back(r);
@@ -794,14 +839,16 @@ static void __fastcall StickVirt_H(void* self, void* /*edx*/, uint32_t arg0, flo
 
 static uint32_t __fastcall StickSmooth_H(void* self, void* /*edx*/, float dt, float* x, float* y)
 {
+	void* const caller = _ReturnAddress(); // v4.1: настоящий вызывающий (в v4 колонка ret_hex была возвращаемым значением, а не адресом)
 	float xin = 0, yin = 0;
 	ReadT(reinterpret_cast<uintptr_t>(x), &xin);
 	ReadT(reinterpret_cast<uintptr_t>(y), &yin);
 	const uintptr_t sp = reinterpret_cast<uintptr_t>(self);
-	if (g_openClamp.load(std::memory_order_relaxed)) // F11: this[3] := "без клэмпа" (исходное значение запоминаем)
+	const int clampLvl = g_openClamp.load(std::memory_order_relaxed);
+	if (clampLvl > 0 && clampLvl <= kClampSteps) // F11: this[3] := ступень лестницы (исходное значение запоминаем)
 	{
 		if (g_clampOrig.find(sp) == g_clampOrig.end()) { float o = 0; if (ReadT(sp + 0xC, &o)) g_clampOrig[sp] = o; }
-		WriteT(sp + 0xC, 1.0e9f);
+		WriteT(sp + 0xC, kClampLadder[clampLvl - 1]);
 	}
 	else if (!g_clampOrig.empty())
 	{
@@ -809,7 +856,7 @@ static uint32_t __fastcall StickSmooth_H(void* self, void* /*edx*/, float dt, fl
 		if (it != g_clampOrig.end()) { WriteT(sp + 0xC, it->second); g_clampOrig.erase(it); }
 	}
 	const uint32_t r = hkStickSmooth.unsafe_thiscall<uint32_t>(self, dt, x, y);
-	OnStickSmooth(self, dt, xin, yin, x, y, r);
+	OnStickSmooth(self, dt, xin, yin, x, y, r, caller);
 	return r;
 }
 
@@ -823,37 +870,63 @@ struct TraceState
 	std::string name;
 	uintptr_t addr = 0;
 	int args = 6, thisDw = 8;
+	int base = 0;                    // регистр, по которому читаются .this и .fields (0 = ecx)
+	std::vector<uint32_t> fields;    // смещения от base (dword), до 16
 	std::atomic<uint64_t> calls{ 0 };
 };
 static TraceState g_trace[opt::kMaxTracers];
 static SafetyHookMid g_traceHooks[opt::kMaxTracers];
 
+static uint32_t CtxReg(const safetyhook::Context& c, int idx)
+{
+	switch (idx)
+	{
+	case 0: return (uint32_t)c.ecx;
+	case 1: return (uint32_t)c.edx;
+	case 2: return (uint32_t)c.eax;
+	case 3: return (uint32_t)c.ebx;
+	case 4: return (uint32_t)c.esi;
+	case 5: return (uint32_t)c.edi;
+	case 6: return (uint32_t)c.ebp;
+	default: return (uint32_t)c.esp;
+	}
+}
+
 static void OnTrace(int id, safetyhook::Context& ctx)
 {
 	TraceState& ts = g_trace[id];
 	const uint64_t n = ts.calls.fetch_add(1, std::memory_order_relaxed) + 1;
-	const uint32_t ecx = (uint32_t)ctx.ecx, edx = (uint32_t)ctx.edx, esp = (uint32_t)ctx.esp;
-	uint32_t ra = 0, a[8] = {}, th[16] = {};
-	ReadT(esp, &ra);
+	const uint32_t ecx = (uint32_t)ctx.ecx, edx = (uint32_t)ctx.edx, esp = (uint32_t)ctx.esp, eax = (uint32_t)ctx.eax;
+	const uint32_t bv = CtxReg(ctx, ts.base);
+	uint32_t ra = 0, a[8] = {}, th[16] = {}, fv[16] = {};
+	ReadT(esp, &ra); // на входе функции это адрес возврата; для хука посреди функции - просто dword на вершине стека
 	if (ts.args > 0) ReadBytes(esp + 4, a, sizeof(uint32_t) * (size_t)ts.args);
-	if (ts.thisDw > 0 && PlausiblePtr(ecx)) ReadBytes(ecx, th, sizeof(uint32_t) * (size_t)ts.thisDw);
+	if (ts.thisDw > 0 && PlausiblePtr(bv)) ReadBytes(bv, th, sizeof(uint32_t) * (size_t)ts.thisDw);
+	if (PlausiblePtr(bv))
+		for (size_t i = 0; i < ts.fields.size() && i < 16; ++i) ReadT((uintptr_t)bv + ts.fields[i], &fv[i]);
 	if (n <= 12)
 	{
 		std::string s;
-		char b[48];
+		char b[64];
 		for (int i = 0; i < ts.args; ++i) { snprintf(b, sizeof(b), " a%d=%08X(%.4g)", i, (unsigned)a[i], (double)BitsToF(a[i])); s += b; }
-		Log("Trace%d %s #%llu: ecx=%08X edx=%08X ret=%s%s", id + 1, ts.name.c_str(), (unsigned long long)n, (unsigned)ecx, (unsigned)edx, Where(reinterpret_cast<void*>(ra)).c_str(), s.c_str());
-		if (ts.thisDw > 0 && PlausiblePtr(ecx))
+		Log("Trace%d %s #%llu: ecx=%08X edx=%08X eax=%08X [esp]=%s%s", id + 1, ts.name.c_str(), (unsigned long long)n, (unsigned)ecx, (unsigned)edx, (unsigned)eax, Where(reinterpret_cast<void*>(ra)).c_str(), s.c_str());
+		if (ts.thisDw > 0 && PlausiblePtr(bv))
 		{
 			s.clear();
 			for (int i = 0; i < ts.thisDw; ++i) { snprintf(b, sizeof(b), " %08X(%.4g)", (unsigned)th[i], (double)BitsToF(th[i])); s += b; }
-			Log("    this[0..%d]:%s", ts.thisDw - 1, s.c_str());
+			Log("    %s[0..%d]:%s", kRegNames[ts.base], ts.thisDw - 1, s.c_str());
+		}
+		if (!ts.fields.empty() && PlausiblePtr(bv))
+		{
+			s.clear();
+			for (size_t i = 0; i < ts.fields.size() && i < 16; ++i) { snprintf(b, sizeof(b), " +%X=%08X(%.4g)", (unsigned)ts.fields[i], (unsigned)fv[i], (double)BitsToF(fv[i])); s += b; }
+			Log("    fields of %s=%08X:%s", kRegNames[ts.base], (unsigned)bv, s.c_str());
 		}
 	}
 	if (!g_capturing.load()) return;
 	TraceRec r = {};
-	r.t = NowMs() - g_capStart; r.id = (uint8_t)id; r.ecx = ecx; r.edx = edx; r.ra = ra;
-	memcpy(r.a, a, sizeof(a)); memcpy(r.th, th, sizeof(th));
+	r.t = NowMs() - g_capStart; r.id = (uint8_t)id; r.ecx = ecx; r.edx = edx; r.ra = ra; r.eax = eax; r.bv = bv;
+	memcpy(r.a, a, sizeof(a)); memcpy(r.th, th, sizeof(th)); memcpy(r.f, fv, sizeof(fv));
 	std::lock_guard<std::mutex> lk(g_stickMu);
 	if (g_recT.size() < opt::kMaxRecs) g_recT.push_back(r);
 }
@@ -1189,7 +1262,11 @@ static void StartCapture()
 		(int)g_stickVirtOn, (int)g_stickSmoothOn, g_traceOn, (int)g_diMouseSeen.load(), (int)g_openClamp.load(), g_cfg.diScale[0], g_cfg.diScale[1], g_cfg.diScale[2]); g_capMeta += b;
 	snprintf(b, sizeof(b), "# mode_codes=v4 (0 PASS, 1 DI-ZERO, 2 DI-xA, 3 DI-xB, 4 DI-xC, 5 ACC-ZERO)\n"); g_capMeta += b;
 	for (int i = 0; i < opt::kMaxTracers; ++i)
-		if (g_trace[i].on) { snprintf(b, sizeof(b), "# trace%d name=%s addr=%08X args=%d this_dwords=%d\n", i + 1, g_trace[i].name.c_str(), (unsigned)g_trace[i].addr, g_trace[i].args, g_trace[i].thisDw); g_capMeta += b; }
+		if (g_trace[i].on) { {
+			snprintf(b, sizeof(b), "# trace%d name=%s addr=%08X args=%d this_dwords=%d base=%s fields=", i + 1, g_trace[i].name.c_str(), (unsigned)g_trace[i].addr, g_trace[i].args, g_trace[i].thisDw, kRegNames[g_trace[i].base]); g_capMeta += b;
+			for (size_t q = 0; q < g_trace[i].fields.size(); ++q) { snprintf(b, sizeof(b), "%s%X", q ? " " : "", (unsigned)g_trace[i].fields[q]); g_capMeta += b; }
+			g_capMeta += "\n";
+		} }
 	g_capMeta += "# conditions: " + cond + "\n";
 
 	g_capStart = NowMs();
@@ -1326,14 +1403,14 @@ static void DumpStick(int idx, const std::vector<VRec>& rv, const std::vector<SR
 		if (f)
 		{
 			fputs(g_capMeta.c_str(), f); fputs(g_capMetaTail.c_str(), f);
-			fputs("t_ms,dt,x_in,y_in,x_out,y_out,id,win,blend,clamp,active,w0,w1,w2,w3,w4,w5,w6,w7,ret_hex\n", f);
+			fputs("t_ms,dt,x_in,y_in,x_out,y_out,id,win,blend,clamp,active,w0,w1,w2,w3,w4,w5,w6,w7,ret_hex,caller_hex\n", f);
 		}
 		for (const SRec& r : rs)
 		{
 			if (f)
-				fprintf(f, "%.3f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f,%.6f,%.6f,%u,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%08X\n", r.t, (double)r.dt, (double)r.xin, (double)r.yin,
+				fprintf(f, "%.3f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f,%.6f,%.6f,%u,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%08X,%08X\n", r.t, (double)r.dt, (double)r.xin, (double)r.yin,
 					(double)r.xout, (double)r.yout, (unsigned)r.id, (double)r.win, (double)r.blend, (double)r.clamp, (unsigned)r.active,
-					(double)r.w[0], (double)r.w[1], (double)r.w[2], (double)r.w[3], (double)r.w[4], (double)r.w[5], (double)r.w[6], (double)r.w[7], (unsigned)r.ret);
+					(double)r.w[0], (double)r.w[1], (double)r.w[2], (double)r.w[3], (double)r.w[4], (double)r.w[5], (double)r.w[6], (double)r.w[7], (unsigned)r.ret, (unsigned)r.caller);
 			if (FiniteF(r.xout, 1.0e9f)) mx = std::max(mx, (double)std::fabs(r.xout));
 			if (FiniteF(r.yout, 1.0e9f)) my = std::max(my, (double)std::fabs(r.yout));
 			if (FiniteF(r.xin, 1.0e9f)) mxin = std::max(mxin, (double)std::fabs(r.xin));
@@ -1342,7 +1419,7 @@ static void DumpStick(int idx, const std::vector<VRec>& rv, const std::vector<SR
 		}
 		if (f) fclose(f);
 		Log("  [sticks] FUN_0040D820: %zu calls, active=%zu, max|in.x|=%.4f, max|out|=(%.4f,%.4f), max clamp=%.4f%s", rs.size(), act, mxin, mx, my, mclamp,
-			g_openClamp.load() ? " (F11 open-clamp was ON)" : "");
+			g_openClamp.load() ? " (F11 clamp ladder was not at level 0 at capture end; per-row clamp is in the csv)" : "");
 	}
 	if (!rt.empty())
 	{
@@ -1352,12 +1429,14 @@ static void DumpStick(int idx, const std::vector<VRec>& rv, const std::vector<SR
 		if (f)
 		{
 			fputs(g_capMeta.c_str(), f); fputs(g_capMetaTail.c_str(), f);
-			fputs("t_ms,id,ecx,edx,ret,a0,a1,a2,a3,a4,a5,a6,a7,t0,t1,t2,t3,t4,t5,t6,t7,t8,t9,t10,t11,t12,t13,t14,t15\n", f);
+			fputs("t_ms,id,ecx,edx,ret,a0,a1,a2,a3,a4,a5,a6,a7,t0,t1,t2,t3,t4,t5,t6,t7,t8,t9,t10,t11,t12,t13,t14,t15,eax,base,f0,f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13,f14,f15\n", f);
 			for (const TraceRec& r : rt)
 			{
 				fprintf(f, "%.3f,%u,%08X,%08X,%08X", r.t, (unsigned)r.id + 1, (unsigned)r.ecx, (unsigned)r.edx, (unsigned)r.ra);
 				for (int i = 0; i < 8; ++i) fprintf(f, ",%08X", (unsigned)r.a[i]);
 				for (int i = 0; i < 16; ++i) fprintf(f, ",%08X", (unsigned)r.th[i]);
+				fprintf(f, ",%08X,%08X", (unsigned)r.eax, (unsigned)r.bv);
+				for (int i = 0; i < 16; ++i) fprintf(f, ",%08X", (unsigned)r.f[i]);
 				fputc('\n', f);
 			}
 			fclose(f);
@@ -1804,7 +1883,7 @@ static void InstallExeHooks()
 		if (g_traceHooks[i])
 		{
 			TraceState& ts = g_trace[i];
-			ts.on = true; ts.name = tc.name.empty() ? std::string(nm) : tc.name; ts.addr = tc.addr.v; ts.args = tc.args; ts.thisDw = tc.thisDwords;
+			ts.on = true; ts.name = tc.name.empty() ? std::string(nm) : tc.name; ts.addr = tc.addr.v; ts.args = tc.args; ts.thisDw = tc.thisDwords; ts.base = tc.base; ts.fields = tc.fields;
 			++g_traceOn;
 		}
 		Log("  %s (%s) hook: %s", nm, tc.name.empty() ? "-" : tc.name.c_str(), g_traceHooks[i] ? "ok" : "FAILED");
@@ -1879,7 +1958,7 @@ static void PrintSecond()
 
 static void DumpCallers()
 {
-	static const Counter apis[] = { C_GetCursorPos, C_SetCursorPos, C_ClipCursor, C_ShowCursor, C_DI_MouseState };
+	static const Counter apis[] = { C_GetCursorPos, C_SetCursorPos, C_ClipCursor, C_ShowCursor, C_DI_MouseState, C_StickSmooth };
 	std::lock_guard<std::mutex> lk(g_callMu);
 	for (Counter id : apis)
 	{
@@ -1923,10 +2002,14 @@ static void CycleMode()
 static void ToggleOpenClamp()
 {
 	if (!g_stickSmoothOn) { Log("F11: UNAVAILABLE (StickSmooth hook FUN_0040D820 is not installed)"); Tone(1, 250); return; }
-	const bool on = !g_openClamp.load();
-	g_openClamp = on;
-	Log("=== F11: open-clamp %s (FUN_0040D820 this[3] := %s) ===", on ? "ON" : "OFF", on ? "1e9 on every call (the original is restored when OFF)" : "original value");
-	Tone(on ? 2 : 1, on ? 1800 : 500);
+	// v4.1: каждое нажатие - следующая ступень: 0 (исходный клэмп) -> 6 -> 12 -> 24 -> 1e9 (открыт) -> 0
+	const int lvl = (g_openClamp.load() + 1) % (kClampSteps + 1);
+	g_openClamp = lvl;
+	if (lvl == 0)
+		Log("=== F11: clamp ladder level 0/%d: FUN_0040D820 this[3] := original value ===", kClampSteps);
+	else
+		Log("=== F11: clamp ladder level %d/%d: FUN_0040D820 this[3] := %g on every call (the original is restored at level 0) ===", lvl, kClampSteps, (double)kClampLadder[lvl - 1]);
+	Tone(lvl == 0 ? 1 : 2, lvl == 0 ? 500 : 900 + 300 * lvl);
 }
 
 static DWORD WINAPI WorkerThread(LPVOID)

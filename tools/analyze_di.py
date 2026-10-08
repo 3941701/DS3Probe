@@ -9,8 +9,8 @@ analyze_di.py - разбор захватов DS3Probe v4: DirectInput-мышь,
                game_* = что отдал DirectInput ДО подмены, out_* = что получила игра (после подмены), mode = режим F9
   _acc.csv     кадры Mouse_GetState (курсорный путь): game_dx/dy = аккумулятор
   _stickv.csv  FUN_0040E680: t_ms,arg0_hex,id,active,x_out,y_out,acc_x,acc_y
-  _sticks.csv  FUN_0040D820: t_ms,dt,x_in,y_in,x_out,y_out,id,win,blend,clamp,active,w0..w7,ret_hex
-  _trace.csv   трассировщики из cfg
+  _sticks.csv  FUN_0040D820: t_ms,dt,x_in,y_in,x_out,y_out,id,win,blend,clamp,active,w0..w7,ret_hex[,caller_hex (v4.1)]
+  _trace.csv   трассировщики из cfg (v4.1: + eax, base, f0..f15 = поля по смещениям из Trace<N>.fields)
 
 Коды режимов v4: 0 PASS, 1 DI-ZERO, 2 DI-xA, 3 DI-xB, 4 DI-xC, 5 ACC-ZERO.
 
@@ -19,7 +19,9 @@ analyze_di.py - разбор захватов DS3Probe v4: DirectInput-мышь,
   [B] режимы DI              сработала ли подмена: сумма out/сумма game ~ K (ZERO ~ 0)
   [C] передаточная кривая    |вход DI| -> |выход стика| по корзинам: линейна ли она, есть ли ПОЛКА (плато) и где
   [D] режимы и стик          как ведёт себя выход стика при DI-ZERO / DI-xK (камера питается от DI?)
-  [E] трассировщики          сколько вызовов, какие адреса возврата
+  [E] трассировщики          сколько вызовов, какие адреса возврата, статистика аргументов/полей (как float)
+  [F] модель FUN_0040D820    сверка формулы окна с логом (ошибка должна быть ~1e-6) и сколько поворота съедает клэмп ±this[3]
+  [G] рывки                  события |dx|>=8: длительность, пик, сумма, хвост обратного знака (отскок на уровне ввода?)
 
 Запуск:  python analyze_di.py <папка сессии>  [--axis x|y] [--max-pair-ms 30]
 Код возврата 0, если файлы разобраны (вердикты - в тексте, это не тест).
@@ -109,7 +111,9 @@ class Cap(object):
         self.acc = []     # (t, ax, ay, mode)
         self.stickv = []  # (t, x, y, accx, accy, active, id)
         self.sticks = []  # (t, dt, xin, yin, xout, yout, clamp, active, id)
+        self.sticks_full = []  # (t, dt, win, blend, clamp, xout, yout, [w0..w7], caller)
         self.trace = []   # (t, id, ecx, ret)
+        self.trace_rows = []
         self.meta = []
         self.raw_ref = None
         self.legacy_di = False
@@ -139,8 +143,11 @@ def load_session(paths):
             cap.stickv = [(fnum(r, "t_ms"), fnum(r, "x_out"), fnum(r, "y_out"), fnum(r, "acc_x"), fnum(r, "acc_y"), int(fnum(r, "active")), int(fnum(r, "id"))) for r in rows]
         elif kind == "sticks":
             cap.sticks = [(fnum(r, "t_ms"), fnum(r, "dt"), fnum(r, "x_in"), fnum(r, "y_in"), fnum(r, "x_out"), fnum(r, "y_out"), fnum(r, "clamp"), int(fnum(r, "active")), int(fnum(r, "id"))) for r in rows]
+            cap.sticks_full = [(fnum(r, "t_ms"), fnum(r, "dt"), fnum(r, "win"), fnum(r, "blend"), fnum(r, "clamp"), fnum(r, "x_out"), fnum(r, "y_out"),
+                                [fnum(r, "w%d" % k) for k in range(8)], r.get("caller_hex", "")) for r in rows]
         elif kind == "trace":
             cap.trace = [(fnum(r, "t_ms"), int(fnum(r, "id")), r.get("ecx", ""), r.get("ret", "")) for r in rows]
+            cap.trace_rows = rows
     for c in caps.values():
         rr = meta_get(c.meta, "raw_reference")
         c.raw_ref = rr
@@ -320,6 +327,15 @@ def block_d(cap, axis, max_ms, out):
 
 
 # ---------------------------------------------------------------- [E] трассировщики
+def hex_float(h):
+    """'3F800000' -> 1.0; пустое/битое -> None"""
+    try:
+        import struct
+        return struct.unpack("<f", struct.pack("<I", int(h, 16)))[0]
+    except Exception:
+        return None
+
+
 def block_e(cap, out):
     if not cap.trace:
         return
@@ -332,9 +348,167 @@ def block_e(cap, out):
         for ecx, ret in by[i]:
             rets[ret] = rets.get(ret, 0) + 1
             ecxs[ecx] = ecxs.get(ecx, 0) + 1
-        out("  [E] Trace%d: %d вызовов; адреса возврата: %s; this: %s" % (
+        out("  [E] Trace%d: %d вызовов; [esp] (адрес возврата, если хук на входе): %s; ecx: %s" % (
             i, len(by[i]), ", ".join("%s x%d" % kv for kv in sorted(rets.items(), key=lambda kv: -kv[1])[:6]),
             ", ".join("%s x%d" % kv for kv in sorted(ecxs.items(), key=lambda kv: -kv[1])[:4])))
+        rows_i = [r for r in cap.trace_rows if int(fnum(r, "id")) == i]
+        names = ["a%d" % k for k in range(8)] + ["f%d" % k for k in range(16)] + ["eax"]
+        parts = []
+        for nm in names:
+            vals = [hex_float(r.get(nm, "")) for r in rows_i]
+            vals = [v for v in vals if v is not None and v == v and abs(v) < 1e12]
+            if len(vals) < 3 or all(abs(v) < 1e-30 for v in vals):
+                continue
+            parts.append("%s: [%.4g..%.4g] med|.|=%.4g" % (nm, min(vals), max(vals), statistics.median([abs(v) for v in vals])))
+        if parts:
+            out("      значения как float (константные/нулевые не показаны): " + "; ".join(parts[:14]))
+
+
+# ---------------------------------------------------------------- [F] модель FUN_0040D820
+WIN_C = 30.0   # константа _DAT_00d22bb0 (подобрана по данным 20261008_082440: ошибка модели < 1e-5)
+
+
+def window_model(sticks_full, axis, clamp_override=None):
+    """Формула FUN_0040D820 (проверена на 4 захватах):
+       push: cur.x += raw/dt, cur.t += dt, cur.n += 1;  если win <= dt + cur.t(до push) - окно прокручивается (prev := cur, cur := 0).
+       X_i = t_i * (x_i / n_i);   w = blend * t_cur / (t_prev + t_cur);   Xb = w*X_cur + (1-w)*X_prev;   Tb = w*t_cur + (1-w)*t_prev
+       выход = clamp(Xb, +-this[3]) / (Tb * 30).
+       Возвращает список (pred, Xb, Tb, real) по кадрам."""
+    k = 0 if axis == "x" else 1
+    res = []
+    c = p = 0
+    prev_ct = None
+    for t, dt, win, blend, clamp, xo, yo, w, _ in sticks_full:
+        cx, px, ct, pt = w[k], w[4 + k], w[2], w[6]
+        if prev_ct is None:
+            rotated = False
+            c, p = 1, 0
+        else:
+            pred_rot = win <= dt + prev_ct + 1e-7
+            exp_ct = (0.0 if pred_rot else prev_ct) + dt
+            rotated = pred_rot if abs(exp_ct - ct) < 5e-4 else (ct < prev_ct - 1e-6)
+            if rotated:
+                p, c = c, 1
+            else:
+                c += 1
+        prev_ct = ct
+        mc = cx / c if c > 0 else 0.0
+        Xc = ct * mc
+        if p > 0 and (pt + ct) > 0:
+            mp = px / p
+            Xp = pt * mp
+            wgt = blend * ct / (pt + ct)
+            Xb = wgt * Xc + (1 - wgt) * Xp
+            Tb = (1 - wgt) * pt + wgt * ct
+        else:
+            Xb, Tb = Xc, ct
+        cl = clamp if clamp_override is None else clamp_override
+        Xcl = max(-cl, min(cl, Xb))
+        pred = Xcl / (Tb * WIN_C) if Tb * WIN_C > 0 else 0.0
+        res.append((pred, Xb, Tb, xo if axis == "x" else yo, dt))
+    return res
+
+
+def block_f(cap, out):
+    if len(cap.sticks_full) < 50:
+        return
+    for axis in ("x", "y"):
+        m = window_model(cap.sticks_full, axis)
+        skip = 4
+        err = [abs(a - r) for a, _, _, r, _ in m[skip:]]
+        nmov = sum(1 for _, _, _, r, _ in m if abs(r) > 1e-6)
+        good = sum(1 for e in err if e < 1e-3)
+        out("  [F] ось %s: модель окна vs лог: макс.ошибка %.2g, кадров с ошибкой <1e-3: %.2f%% (кадров с движением %d)" % (
+            axis, max(err) if err else float("nan"), 100.0 * good / max(1, len(err)), nmov))
+        if err and good / float(len(err)) < 0.99:
+            out("      !!! модель не сходится: формула другая (другая сборка/версия?) - выводы блока F ненадёжны")
+            continue
+        clamp_logged = max(r[4] for r in cap.sticks_full)
+        open_ = window_model(cap.sticks_full, axis, clamp_override=1e9)
+        for lim in (2.0,):
+            cl = window_model(cap.sticks_full, axis, clamp_override=lim)
+            i_open = sum(abs(a) * dt for a, _, _, _, dt in open_)
+            i_cl = sum(abs(a) * dt for a, _, _, _, dt in cl)
+            n_over = sum(1 for _, xb, _, _, _ in open_ if abs(xb) > lim)
+            tb = [tb_ for _, xb, tb_, _, _ in open_ if abs(xb) > lim]
+            thr = (62.5 / statistics.median(tb)) if tb else float("nan")
+            out("      клэмп %.1f: кадров с |Xb|>%.1f: %d из %d с движением; интеграл|вых|·dt без клэмпа %.2f, с клэмпом %.2f -> клэмп съедает %.1f%% поворота; "
+                "порог %s (= 62.5/Tb: 62.5 отсчёта за окно ~2 кадра)%s" % (
+                    lim, lim, n_over, nmov, i_open, i_cl, 100.0 * (1 - i_cl / i_open) if i_open > 0 else 0.0,
+                    ("~%.0f отсчётов/с" % thr) if thr == thr else "не достигнут",
+                    "  [в логе клэмп был открыт: F11]" if clamp_logged > 100 else ""))
+
+
+# ---------------------------------------------------------------- [H] лестница клэмпа F11 (v4.1)
+def block_h(cap, out):
+    """F11 в v4.1 - лестница this[3]: 2 (исходный) -> 6 -> 12 -> 24 -> 1e9. Если в одном захвате встретилось 2+ значения
+       клэмпа (колонка clamp в _sticks.csv), показываем по каждой ступени: кадры, кадры у потолка, максимум |вых.x|, интеграл |вых.x|*dt.
+       Ступень, на которой ВПЕРВЫЕ появилось ощущение «упёрлось и отскочило» (сравните со временем нажатий F11 в ds3probe.log),
+       и есть оценка предела следующего ограничителя: в единицах выхода стика max|вых.x| этой ступени."""
+    sf = cap.sticks_full
+    if len(sf) < 50:
+        return
+    levels = sorted(set(round(r[4], 3) for r in sf))
+    if len(levels) < 2:
+        return
+    model = window_model(sf, "x")
+    agg = {}
+    for r, (_pred, xb, _tb, real, dt) in zip(sf, model):
+        key = round(r[4], 3)
+        a = agg.setdefault(key, [0, 0, 0.0, 0, 0.0])
+        a[0] += 1
+        if abs(real) > 1e-6:
+            a[1] += 1
+        a[2] = max(a[2], abs(real))
+        if abs(xb) >= key * 0.999:
+            a[3] += 1
+        a[4] += abs(real) * dt
+    out("  [H] лестница клэмпа F11 (this[3]): ступеней в захвате %d" % len(levels))
+    for key in levels:
+        n, nmov, mx, nceil, integ = agg[key]
+        name = "открыт (1e9)" if key > 1e6 else ("%g" % key)
+        out("      клэмп %-12s кадров %5d (с движением %4d) | макс|вых.x| %7.3f | кадров у потолка %4d | интеграл|вых.x|*dt %8.3f" % (name, n, nmov, mx, nceil, integ))
+    out("      как читать: ступень, где «упор и отскок» начался, - первая, на которой макс|вых.x| превысил предел следующего ограничителя;"
+        " отметьте время нажатий F11 в ds3probe.log и сверьте с ощущением")
+
+
+# ---------------------------------------------------------------- [G] рывки
+def block_g(cap, out, axis="x", thr=8, gap=2, top=5):
+    if not cap.di or cap.legacy_di:
+        return
+    ci = 1 if axis == "x" else 2
+    v = [r[ci] for r in cap.di]
+    n = len(v)
+    ev = []
+    i = 0
+    while i < n:
+        if abs(v[i]) >= thr:
+            j = last = i
+            while j < n and (abs(v[j]) >= thr or j - last <= gap):
+                if abs(v[j]) >= thr:
+                    last = j
+                j += 1
+            ev.append((i, last))
+            i = last + 1
+        else:
+            i += 1
+    if not ev:
+        return
+    stats = []
+    for a, b in ev:
+        seg = v[a:b + 1]
+        tot = sum(seg)
+        sa = sum(abs(x) for x in seg)
+        opp = sum(abs(x) for x in seg if x * tot < 0)
+        tail = v[b + 1:b + 9]
+        tail_opp = sum(abs(x) for x in tail if x * tot < 0)
+        stats.append((sa, a, b, tot, max(abs(x) for x in seg), opp / sa if sa else 0.0, tail_opp / sa if sa else 0.0))
+    stats.sort(reverse=True)
+    big = [s_ for s_ in stats if s_[4] >= 60]
+    out("  [G] ось %s: событий |dx|>=%d: %d; из них с пиком >=60 отсчётов/кадр (>=~2 порогов клэмпа): %d" % (axis, thr, len(ev), len(big)))
+    out("      топ-%d по сумме: кадры a..b | длит. | Σdx | пик | обратный знак внутри | обратный знак в 8 кадрах хвоста (доля от Σ|dx|)" % top)
+    for sa, a, b, tot, pk, opp, tail in stats[:top]:
+        out("        %5d..%-5d | %2d | %7.0f | %4.0f | %5.1f%% | %5.1f%%" % (a, b, b - a + 1, tot, pk, 100 * opp, 100 * tail))
 
 
 def main(argv=None):
@@ -367,6 +541,9 @@ def main(argv=None):
         block_c(cap, a.axis, a.max_pair_ms, out)
         block_d(cap, a.axis, a.max_pair_ms, out)
         block_e(cap, out)
+        block_f(cap, out)
+        block_g(cap, out)
+        block_h(cap, out)
     return 0
 
 

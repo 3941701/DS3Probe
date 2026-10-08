@@ -8,6 +8,7 @@
   compress  стик = k * x / (1 + |x|/60)             -> блок C: сжатие
   notdi     стик питается не от DI (скрытый сигнал) -> блок D: пометка "стик питается не от DI"
   legacy    _di.csv формата v3                      -> блок B пропускается, без падения
+  ladder    лестница клэмпа F11 (2/6/12/1e9)        -> блок H: 4 ступени, потолок реже на высоких ступенях, 0 на открытой
 Запуск:  python tests/test_analyze_di.py     (код возврата 0 = всё сошлось)
 """
 import contextlib
@@ -15,8 +16,10 @@ import io
 import math
 import os
 import random
+import re
 import sys
 import tempfile
+import types
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
 import analyze_di as ad  # noqa: E402
@@ -85,6 +88,65 @@ def build(tmp, kind, with_stick=True, legacy=False):
     return d
 
 
+def sim_rows(counts, clamps, win=1.0 / 30.0, blend=1.0, c30=30.0):
+    """Симулятор FUN_0040D820 (формула из анализа 20261008): строки sticks_full для block_h/window_model."""
+    cur = [0.0, 0.0, 0.0, 0]
+    prev = [0.0, 0.0, 0.0, 0]
+    rows = []
+    t = 0.0
+    for i, (cx, cl) in enumerate(zip(counts, clamps)):
+        dt = 0.013 if i % 2 == 0 else 0.014
+        if win <= dt + cur[2]:
+            prev = cur[:]
+            cur = [0.0, 0.0, 0.0, 0]
+        cur[0] += 0.032 * cx / dt
+        cur[2] += dt
+        cur[3] += 1
+        xc = cur[2] * (cur[0] / cur[3])
+        if prev[3] > 0:
+            xp = prev[2] * (prev[0] / prev[3])
+            w = blend * cur[2] / (prev[2] + cur[2])
+            xb = w * xc + (1 - w) * xp
+            tb = w * cur[2] + (1 - w) * prev[2]
+        else:
+            xb, tb = xc, cur[2]
+        o = max(-cl, min(cl, xb)) / (tb * c30)
+        rows.append((t, dt, win, blend, cl, o, 0.0, [cur[0], 0.0, cur[2], 0.0, prev[0], 0.0, prev[2], 0.0], 0))
+        t += dt * 1000.0
+    return rows
+
+
+def test_ladder():
+    levels = [2.0, 6.0, 12.0, 1.0e9]
+    counts, clamps = [], []
+    for lv in levels:
+        seg = signal(900, seed=11)
+        counts += seg
+        clamps += [lv] * len(seg)
+    cap = types.SimpleNamespace(sticks_full=sim_rows(counts, clamps))
+    lines = []
+    ad.block_h(cap, lines.append)
+    txt = "\n".join(lines)
+    got = {}
+    for l in lines:
+        m = re.search(r"клэмп (\S+(?: \(1e9\))?)\s+кадров\s+(\d+).*макс\|вых\.x\|\s+([0-9.]+).*у потолка\s+(\d+)", l)
+        if m:
+            got[m.group(1)] = (int(m.group(2)), float(m.group(3)), int(m.group(4)))
+    ok = len(got) == 4
+    keys = list(got)
+    if ok:
+        mx = [got[k][1] for k in keys]
+        ceil = [got[k][2] for k in keys]
+        ok = (mx == sorted(mx) and mx[0] < mx[-1] and ceil[0] > ceil[1] >= ceil[2] and ceil[-1] == 0 and all(got[k][0] == 900 for k in keys))
+    # одна ступень -> блок молчит
+    cap1 = types.SimpleNamespace(sticks_full=sim_rows(counts[:900], clamps[:900]))
+    lines1 = []
+    ad.block_h(cap1, lines1.append)
+    ok = ok and not lines1
+    return expect("ladder", ok, txt + "\n" + repr(got))
+
+
+
 def run(d):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
@@ -116,6 +178,7 @@ def main():
                 ok &= expect(kind, "стик питается не от DI" in txt, txt)
         rc, txt = run(build(tmp, "linear", with_stick=False, legacy=True))
         ok &= expect("legacy", rc == 0 and "формата v3" in txt and "[A]" in txt, txt)
+    ok &= test_ladder()
     print("TOTAL: %s" % ("ALL OK" if ok else "MISMATCH"))
     return 0 if ok else 1
 
