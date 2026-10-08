@@ -1010,6 +1010,9 @@ struct WatchHit
 	std::atomic<uint32_t> eip{ 0 };       // публикуется последним; 0 = слот свободен
 	int watch = 0;                        // 0..3
 	uint32_t tid = 0, val = 0, stk[6] = {};
+	uint32_t regs[7] = {};                // eax ebx ecx edx esi edi ebp в момент ловушки
+	uint32_t snap[7][12] = {};            // по 12 dword от каждого регистра, похожего на указатель (иначе нули)
+	uint8_t code[16] = {};                // байты по адресу eip (для ключа TraceN.bytes, если захочется поставить mid-хук сюда)
 	uint64_t firstFrame = 0, lastFrame = 0;
 	std::atomic<uint64_t> count{ 0 };
 };
@@ -1051,6 +1054,11 @@ static LONG CALLBACK WatchVeh(PEXCEPTION_POINTERS ep)
 				if (!ReadT((uintptr_t)c->Esp + 4u * q, &v)) break;
 				if (InImage(v)) h->stk[got++] = v;
 			}
+			h->regs[0] = (uint32_t)c->Eax; h->regs[1] = (uint32_t)c->Ebx; h->regs[2] = (uint32_t)c->Ecx; h->regs[3] = (uint32_t)c->Edx;
+			h->regs[4] = (uint32_t)c->Esi; h->regs[5] = (uint32_t)c->Edi; h->regs[6] = (uint32_t)c->Ebp;
+			for (int r = 0; r < 7; ++r)
+				if (PlausiblePtr(h->regs[r])) ReadBytes((uintptr_t)h->regs[r], h->snap[r], sizeof(h->snap[r]));
+			ReadBytes((uintptr_t)eip, h->code, sizeof(h->code));
 			h->eip.store(eip, std::memory_order_release);
 		}
 		h->lastFrame = fr; h->val = val;
@@ -1157,6 +1165,19 @@ static void WatchFlushLog(bool summary)
 		char b[512];
 		std::string s;
 		for (int q = 0; q < 6 && h.stk[q]; ++q) { snprintf(b, sizeof(b), " %s", Where(reinterpret_cast<void*>((uintptr_t)h.stk[q])).c_str()); s += b; }
+		if (!summary)
+		{
+			static const char* kRn[7] = { "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp" };
+			std::string cs;
+			for (int q = 0; q < 16; ++q) { snprintf(b, sizeof(b), "%s%02X", q ? " " : "", (unsigned)h.code[q]); cs += b; }
+			Log("watch-code W%d eip=%08X bytes: %s", h.watch + 1, (unsigned)eip, cs.c_str());
+			for (int r = 0; r < 7; ++r)
+			{
+				std::string ws;
+				for (int q = 0; q < 12; ++q) { snprintf(b, sizeof(b), " %08X(%.4g)", (unsigned)h.snap[r][q], (double)BitsToF(h.snap[r][q])); ws += b; }
+				Log("watch-reg W%d %s=%08X%s", h.watch + 1, kRn[r], (unsigned)h.regs[r], PlausiblePtr(h.regs[r]) ? ws.c_str() : " (not a pointer)");
+			}
+		}
 		const WatchCfg& w = g_cfg.watch[h.watch];
 		Log("watch%s W%d (%s %s+0x%X) eip=%s tid=%u count=%llu frames=%llu..%llu lastvalue=%08X(%.6g) stack(exe):%s", summary ? "-summary" : "-new", h.watch + 1, w.rw == 1 ? "write" : "read/write",
 			w.base == 1 ? "ctrl" : (w.base == 2 ? "camblock" : "abs"), (unsigned)w.off, Where(reinterpret_cast<void*>((uintptr_t)eip)).c_str(), (unsigned)h.tid,
