@@ -3,6 +3,7 @@ name: Build DS3Probe
 on:
   push:
     branches: [ main ]
+  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -22,4 +23,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dinput8
-          path: build/Release/dinput8.dll
+          path: |
+            build/Release/dinput8.dll
+            README.md
+            ds3probe.cfg.example
+            ds3probe_camdump.cfg.example
+            tools/analyze_di.py
