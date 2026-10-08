@@ -1036,7 +1036,8 @@ static LONG CALLBACK WatchVeh(PEXCEPTION_POINTERS ep)
 		const uint64_t fr = g_ctrlCalls.load(std::memory_order_relaxed);
 		uint32_t val = 0;
 		const uint32_t a = g_watchAddr[i].load(std::memory_order_relaxed);
-		if (a) ReadT((uintptr_t)a, &val);
+		// НЕЛЬЗЯ читать наблюдаемый адрес, если точка ловит и чтение (rw): чтение внутри обработчика даст новую ловушку -> рекурсия -> вылет
+		if (a && g_cfg.watch[i].rw == 1) ReadT((uintptr_t)a, &val);
 		if (!h)
 		{
 			const int idx = g_hitN.fetch_add(1, std::memory_order_acq_rel);
