@@ -48,6 +48,7 @@
 //  9. Звук: F7 - 1 писк, F8 - 2 писка, F9 - 1/2/3 писка (PASS/RAW/ZERO), ошибка - низкий тон.
 //
 // Хоткеи (работают, только когда окно игры в фокусе):
+//   F4 - (v4.3) обход сглаживателя yaw/pitch контроллера камеры (нужны tracer role=ctrl/camblock/apply)
 //   F5 - (v4.2) метка "вижу рикошёт сейчас" в захвате
 //   F6 - маркер + таблица "кто вызывает user32"    F7/F8 - начало/конец захвата (CSV + итоги в лог)
 //   F9 - режим (см. B выше)                        F10   - условия опыта + список зарегистрированных raw-устройств
@@ -89,10 +90,11 @@
 #ifndef DS3PROBE_GIT_SHA
 #define DS3PROBE_GIT_SHA "unknown"
 #endif
-#define DS3PROBE_VERSION "v4.2"
+#define DS3PROBE_VERSION "v4.3"
 
 namespace opt
 {
+	constexpr int kVkFollow = VK_F4;   // v4.3: вкл/выкл обход сглаживателя yaw/pitch контроллера (опыт "follower bypass")
 	constexpr int kVkBounce = VK_F5;   // v4.2: "вижу рикошёт прямо сейчас" - метка времени в захвате
 	constexpr int kVkMarker = VK_F6;
 	constexpr int kVkStart  = VK_F7;
@@ -331,7 +333,7 @@ static const Profile kProfiles[] =
 struct CfgAddr  { bool set = false; uintptr_t v = 0; };
 struct CfgBytes { bool set = false; std::string v; };
 struct TraceCfg { CfgAddr addr; CfgBytes bytes; std::string name; int args = 6; int thisDwords = 8; int base = 0; std::vector<uint32_t> fields;
-	int dumpOff = 0; int dumpLen = 0; int dumpFrom = 0; }; // v4.2: dump = смещение (hex, может быть со знаком) и длина в байтах; dumpfrom = номер трассировщика, чей base брать за указатель (0 = свой)
+	int dumpOff = 0; int dumpLen = 0; int dumpFrom = 0; int role = 0; }; // v4.2: dump = смещение (hex, может быть со знаком) и длина в байтах; dumpfrom = номер трассировщика, чей base брать за указатель (0 = свой)
 struct Config
 {
 	std::wstring file;           // какой файл прочитан
@@ -601,7 +603,13 @@ static void LoadConfig()
 				else CfgErr(ln, k, "expected '<offset hex, optional minus> <length hex, multiple of 4, <= 400>', e.g. -20 300");
 			}
 			else if (sub == "dumpfrom") { int n = 0; if (ParseInt(v, 0, opt::kMaxTracers, &n)) g_cfg.trace[ti].dumpFrom = n; else CfgErr(ln, k, "expected 0..8 (number of the tracer whose base register is the pointer; 0 = own)"); }
-			else CfgErr(ln, k, "unknown trace sub-key (bytes|name|args|this|base|fields|dump|dumpfrom)");
+			else if (sub == "role")
+			{
+				const std::string rv = Lower(v);
+				if (rv == "ctrl") g_cfg.trace[ti].role = 1; else if (rv == "camblock") g_cfg.trace[ti].role = 2; else if (rv == "apply") g_cfg.trace[ti].role = 3;
+				else CfgErr(ln, k, "expected ctrl|camblock|apply");
+			}
+			else CfgErr(ln, k, "unknown trace sub-key (bytes|name|args|this|base|fields|dump|dumpfrom|role)");
 		}
 	}
 	Log("cfg: parsed, %d error(s)%s", g_cfg.errors, g_cfg.errors ? " -> exe hooks will NOT be installed until the cfg is fixed" : "");
@@ -908,11 +916,32 @@ struct TraceState
 	int args = 6, thisDw = 8;
 	int base = 0;                    // регистр, по которому читаются .this и .fields (0 = ecx)
 	std::vector<uint32_t> fields;    // смещения от base (dword), до 16
+	int role = 0;                    // v4.3: 1 = base - объект-контроллер LookUpdate, 2 = base - блок камеры (cam+0x20), 3 = здесь применяется обход (F4)
 	int dumpOff = 0, dumpLen = 0, dumpFrom = 0; // v4.2: дамп памяти объекта (см. TraceCfg)
 	std::atomic<uint32_t> lastBase{ 0 };         // последнее значение base-регистра (чтобы другие трассировщики брали его как указатель)
 	std::atomic<uint64_t> calls{ 0 };
 };
 static TraceState g_trace[opt::kMaxTracers];
+// v4.3: обход сглаживателя yaw/pitch контроллера LookUpdate. Данные сессии 223501: контроллер хранит свою пару углов
+// (this+0x40 pitch, this+0x44 yaw), которая каждый кадр догоняет угол камеры по кратчайшей дуге:
+//   x += 7.5*dt*wrap(target - x),  target_pitch = cam pitch,  target_yaw = atan2(m[0].x, m[0].z) - pi/2 (m = матрица блока камеры).
+// F4 каждый кадр (после фиксации поворота) принудительно ставит x := target, т.е. убирает отставание и перескоки.
+static std::atomic<bool> g_followFix{ false };
+static std::atomic<uint32_t> g_ctrlPtr{ 0 }, g_camBlk{ 0 };
+static std::atomic<uint64_t> g_followApplied{ 0 };
+static void ApplyFollowFix()
+{
+	const uint32_t c = g_ctrlPtr.load(), b = g_camBlk.load();
+	if (!PlausiblePtr(c) || !PlausiblePtr(b)) return;
+	float pitch = 0, m12 = 0, m14 = 0;
+	if (!ReadT((uintptr_t)b, &pitch) || !ReadT((uintptr_t)b + 0x10, &m12) || !ReadT((uintptr_t)b + 0x18, &m14)) return;
+	if (!(std::fabs(pitch) < 3.2f) || !(std::fabs(m12) <= 1.001f) || !(std::fabs(m14) <= 1.001f)) return;
+	float yaw = std::atan2(m12, m14) - 1.57079632679f;
+	if (yaw < -3.14159265f) yaw += 6.28318531f;
+	WriteT((uintptr_t)c + 0x40, pitch);
+	WriteT((uintptr_t)c + 0x44, yaw);
+	g_followApplied.fetch_add(1, std::memory_order_relaxed);
+}
 static SafetyHookMid g_traceHooks[opt::kMaxTracers];
 
 static uint32_t CtxReg(const safetyhook::Context& c, int idx)
@@ -937,6 +966,9 @@ static void OnTrace(int id, safetyhook::Context& ctx)
 	const uint32_t ecx = (uint32_t)ctx.ecx, edx = (uint32_t)ctx.edx, esp = (uint32_t)ctx.esp, eax = (uint32_t)ctx.eax;
 	const uint32_t bv = CtxReg(ctx, ts.base);
 	ts.lastBase.store(bv, std::memory_order_relaxed);
+	if (ts.role == 1) g_ctrlPtr.store(bv, std::memory_order_relaxed);
+	else if (ts.role == 2) g_camBlk.store(bv, std::memory_order_relaxed);
+	else if (ts.role == 3 && g_followFix.load(std::memory_order_relaxed)) ApplyFollowFix();
 	uint32_t ra = 0, a[8] = {}, th[16] = {}, fv[16] = {};
 	ReadT(esp, &ra); // на входе функции это адрес возврата; для хука посреди функции - просто dword на вершине стека
 	if (ts.args > 0) ReadBytes(esp + 4, a, sizeof(uint32_t) * (size_t)ts.args);
@@ -1327,6 +1359,7 @@ static void StartCapture()
 			}
 			g_capMeta += "\n";
 		} }
+	snprintf(b, sizeof(b), "# followfix=%d (F4 follower bypass; 1 = controller yaw/pitch forced to target each frame)\n", (int)g_followFix.load()); g_capMeta += b;
 	g_capMeta += "# conditions: " + cond + "\n";
 
 	g_capStart = NowMs();
@@ -1988,7 +2021,7 @@ static void InstallExeHooks()
 		{
 			TraceState& ts = g_trace[i];
 			ts.on = true; ts.name = tc.name.empty() ? std::string(nm) : tc.name; ts.addr = tc.addr.v; ts.args = tc.args; ts.thisDw = tc.thisDwords; ts.base = tc.base; ts.fields = tc.fields;
-			ts.dumpOff = tc.dumpOff; ts.dumpLen = tc.dumpLen; ts.dumpFrom = tc.dumpFrom;
+			ts.dumpOff = tc.dumpOff; ts.dumpLen = tc.dumpLen; ts.dumpFrom = tc.dumpFrom; ts.role = tc.role;
 			++g_traceOn;
 		}
 		Log("  %s (%s) hook: %s", nm, tc.name.empty() ? "-" : tc.name.c_str(), g_traceHooks[i] ? "ok" : "FAILED");
@@ -2133,7 +2166,7 @@ static DWORD WINAPI WorkerThread(LPVOID)
 
 	const double t0 = NowMs();
 	double nextSec = t0 + 1000.0, d3d9Seen = -1.0;
-	bool k5 = false, k6 = false, k7 = false, k8 = false, k9 = false, k10 = false, k11 = false;
+	bool k4 = false, k5 = false, k6 = false, k7 = false, k8 = false, k9 = false, k10 = false, k11 = false;
 	int marker = 0;
 
 	for (;;)
@@ -2151,9 +2184,18 @@ static DWORD WINAPI WorkerThread(LPVOID)
 		if (g_mode.load() != M_PASS && now - g_modeSince.load() > opt::kModeAutoRevertMs) { SetMode(M_PASS, "auto-revert after 2 min"); Tone(1, 300); }
 
 		const bool fg = GameFocused();
+		const bool n4 = fg && KeyDown(opt::kVkFollow);
 		const bool n5 = fg && KeyDown(opt::kVkBounce);
 		const bool n6 = fg && KeyDown(opt::kVkMarker), n7 = fg && KeyDown(opt::kVkStart), n8 = fg && KeyDown(opt::kVkStop);
 		const bool n9 = fg && KeyDown(opt::kVkMode), n10 = fg && KeyDown(opt::kVkInfo), n11 = fg && KeyDown(opt::kVkOpen);
+		if (n4 && !k4)
+		{
+			const bool on = !g_followFix.load();
+			g_followFix.store(on);
+			Log("=== F4: follower bypass %s (ctrl=%08X camblock=%08X applied so far=%llu) ===", on ? "ON" : "OFF", (unsigned)g_ctrlPtr.load(), (unsigned)g_camBlk.load(), (unsigned long long)g_followApplied.load());
+			if (on && (!g_ctrlPtr.load() || !g_camBlk.load())) Log("  F4: pointers not known yet (need tracers with role=ctrl and role=camblock, and role=apply) - nothing will be written");
+			Tone(on ? 2 : 1, on ? 1500 : 500);
+		}
 		if (n5 && !k5)
 		{
 			if (g_capturing.load())
@@ -2171,7 +2213,7 @@ static DWORD WINAPI WorkerThread(LPVOID)
 		if (n9 && !k9) CycleMode();
 		if (n10 && !k10) { LogConditions("F10"); LogRegisteredRaw("F10"); }
 		if (n11 && !k11) ToggleOpenClamp();
-		k5 = n5; k6 = n6; k7 = n7; k8 = n8; k9 = n9; k10 = n10; k11 = n11;
+		k4 = n4; k5 = n5; k6 = n6; k7 = n7; k8 = n8; k9 = n9; k10 = n10; k11 = n11;
 
 		if (now >= nextSec) { nextSec += 1000.0; PrintSecond(); }
 	}
