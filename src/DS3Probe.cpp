@@ -94,7 +94,7 @@
 #ifndef DS3PROBE_GIT_SHA
 #define DS3PROBE_GIT_SHA "unknown"
 #endif
-#define DS3PROBE_VERSION "v4.8"
+#define DS3PROBE_VERSION "v4.9"
 
 namespace opt
 {
@@ -1045,13 +1045,18 @@ static void ApplyWeightFix(uint32_t c)
 }
 // v4.8: прицел. ApplyRotDelta (FUN_00721BD0) зовётся из кода прицела с адресов возврата 00552176 (a0 = pitch, a1 = yaw) и 00552222 (a0 = pitch).
 // Данные 20261009_220909 (3597 кадров): a1 = -M_y * 100deg/s * x_out * dt, a0 = +M_p * 80deg/s * y_out * dt, где x_out/y_out - выход сглаживателя
-// того же кадра (вызов из 00549F2E), а M - общий "разгон" игры: растёт на ~0.04 за кадр, пока стик > 1 (полное отклонение), и спадает на ~0.05 за кадр
-// ниже 1; потолок M_y = 2.0, M_p не меньше 1.7. Из-за этого скорость поворота при плавном ведении "плавает" на десятки процентов. Если x_out = 0, то a1 = 0
-// точно (0 исключений на 3597 кадрах), других слагаемых нет. Поэтому подменяем a0/a1 на M = 1. Проверка модели: отношение к базе должно лежать в
-// [0.97, 2.15] (оба); иначе кадр не трогаем (g_alModel). Максимум M на данных: yaw 2.000, pitch 1.695.
-static std::atomic<uint64_t> g_alCalls{ 0 }, g_alYaw{ 0 }, g_alPitch{ 0 }, g_alStale{ 0 }, g_alModel{ 0 }, g_alWriteFail{ 0 };
-static std::atomic<float> g_alMaxMY{ 1.0f }, g_alMaxMP{ 1.0f };
+// того же кадра (вызов из 00549F2E), а M - "разгон" игры: растёт, пока стик > 1 (полное отклонение), и спадает ниже 1. Если x_out = 0, то a1 = 0
+// точно (0 исключений на 3597 кадрах), других слагаемых нет. Поэтому подменяем a0/a1 на M = 1.
+// v4.9: потолки M РАЗНЫЕ: yaw 2.0, pitch 4.0 (на 220909 M_p = 4.0000 на 36 кадрах из 1560, 2.15 превышен на всех этих кадрах). В v4.8 границы проверки были
+// [0.97, 2.15] для обеих осей (мой вывод "pitch не больше 1.7" был сделан по выборке, уже отфильтрованной этой границей), и кадры с M_p > 2.15 оставались с игровым
+// разгоном - скачок между M = 1 (подмена) и M до 4 (пропуск). Теперь каждая ось проверяется и подменяется отдельно, границы yaw [0.97, 2.5], pitch [0.97, 4.5].
+static std::atomic<uint64_t> g_alCalls{ 0 }, g_alYaw{ 0 }, g_alPitch{ 0 }, g_alStale{ 0 }, g_alModel{ 0 }, g_alWriteFail{ 0 }, g_alSkipYaw{ 0 }, g_alSkipPitch{ 0 };
+static std::atomic<float> g_alMaxMY{ 1.0f }, g_alMaxMP{ 1.0f };   // максимум отношения к базе по ВСЕМ кадрам, в том числе не прошедшим проверку
+static std::atomic<uint32_t> g_alHistY[6], g_alHistP[6];            // распределение M (<=1.05, <=1.5, <=2.0, <=3.0, <=4.05, больше) по всем кадрам с вычисленным M
+static std::atomic<int> g_alSkipLogged{ 0 };
 static const double kAimBaseYaw = 1.7453292519943295, kAimBasePitch = 1.3962634015954636;   // 100 и 80 градусов/с на единицу выхода сглаживателя
+static const double kAimYawLo = 0.97, kAimYawHi = 2.5, kAimPitchLo = 0.97, kAimPitchHi = 4.5;
+static inline int AimHistBucket(double m) { return m <= 1.05 ? 0 : (m <= 1.5 ? 1 : (m <= 2.0 ? 2 : (m <= 3.0 ? 3 : (m <= 4.05 ? 4 : 5)))); }
 static void AimLinearize(uint32_t esp, uint32_t ra)
 {
 	if (!g_cfg.aimLinear || !g_followFix.load(std::memory_order_relaxed)) return;
@@ -1063,24 +1068,40 @@ static void AimLinearize(uint32_t esp, uint32_t ra)
 	float a0 = 0, a1 = 0;
 	if (!ReadT((uintptr_t)esp + 4, &a0) || !ReadT((uintptr_t)esp + 8, &a1) || !FiniteF(x, 1.0e6f) || !FiniteF(y, 1.0e6f) || !(dt > 0.0f && dt < 1.0f)) { g_alModel.fetch_add(1, std::memory_order_relaxed); return; }
 	const double bYaw = -kAimBaseYaw * (double)x * (double)dt, bPitch = kAimBasePitch * (double)y * (double)dt;
-	double my = 1.0, mp = 1.0; bool fixY = false, fixP = false;
-	// |a| < 1e-6 - шум округления (во втором вызове при покое бывает ~1e-8), считаем нулём и не трогаем
+	double my = 1.0, mp = 1.0; bool fixY = false, fixP = false, skip = false;
+	// |a| < 1e-6 - шум округления (во втором вызове при покое бывает ~1e-8), считаем нулём и не трогаем. Оси проверяются независимо.
 	if (std::fabs(a1) >= 1.0e-6f)
 	{
-		if (std::fabs(x) < 1.0e-6f) { g_alModel.fetch_add(1, std::memory_order_relaxed); return; }
-		my = (double)a1 / bYaw;
-		if (!(my >= 0.97 && my <= 2.15)) { g_alModel.fetch_add(1, std::memory_order_relaxed); return; }
-		fixY = true;
+		if (std::fabs(x) < 1.0e-6f) { skip = true; g_alSkipYaw.fetch_add(1, std::memory_order_relaxed); }
+		else
+		{
+			my = (double)a1 / bYaw;
+			MaxF(g_alMaxMY, (float)my); g_alHistY[AimHistBucket(my)].fetch_add(1, std::memory_order_relaxed);
+			if (my >= kAimYawLo && my <= kAimYawHi) fixY = true; else { skip = true; g_alSkipYaw.fetch_add(1, std::memory_order_relaxed); }
+		}
+		if (skip && g_alSkipLogged.fetch_add(1, std::memory_order_relaxed) < 16)
+			Log("AimLinear: yaw not fixed (ret %08X): x=%.5f y=%.5f dt=%.4f a1=%.6g a0=%.6g ratio=%.3f (allowed %.2f..%.2f)", ra, (double)x, (double)y, (double)dt, (double)a1, (double)a0, my, kAimYawLo, kAimYawHi);
 	}
 	if (std::fabs(a0) >= 1.0e-6f)
 	{
-		if (std::fabs(y) < 1.0e-6f) { g_alModel.fetch_add(1, std::memory_order_relaxed); return; }
-		mp = (double)a0 / bPitch;
-		if (!(mp >= 0.97 && mp <= 2.15)) { g_alModel.fetch_add(1, std::memory_order_relaxed); return; }
-		fixP = true;
+		bool skipP = false;
+		if (std::fabs(y) < 1.0e-6f) skipP = true;
+		else
+		{
+			mp = (double)a0 / bPitch;
+			MaxF(g_alMaxMP, (float)mp); g_alHistP[AimHistBucket(mp)].fetch_add(1, std::memory_order_relaxed);
+			if (mp >= kAimPitchLo && mp <= kAimPitchHi) fixP = true; else skipP = true;
+		}
+		if (skipP)
+		{
+			skip = true; g_alSkipPitch.fetch_add(1, std::memory_order_relaxed);
+			if (g_alSkipLogged.fetch_add(1, std::memory_order_relaxed) < 16)
+				Log("AimLinear: pitch not fixed (ret %08X): x=%.5f y=%.5f dt=%.4f a1=%.6g a0=%.6g ratio=%.3f (allowed %.2f..%.2f)", ra, (double)x, (double)y, (double)dt, (double)a1, (double)a0, mp, kAimPitchLo, kAimPitchHi);
+		}
 	}
-	if (fixY) { if (WriteT((uintptr_t)esp + 8, (float)bYaw)) g_alYaw.fetch_add(1, std::memory_order_relaxed); else g_alWriteFail.fetch_add(1, std::memory_order_relaxed); MaxF(g_alMaxMY, (float)my); }
-	if (fixP) { if (WriteT((uintptr_t)esp + 4, (float)bPitch)) g_alPitch.fetch_add(1, std::memory_order_relaxed); else g_alWriteFail.fetch_add(1, std::memory_order_relaxed); MaxF(g_alMaxMP, (float)mp); }
+	if (skip) g_alModel.fetch_add(1, std::memory_order_relaxed);
+	if (fixY) { if (WriteT((uintptr_t)esp + 8, (float)bYaw)) g_alYaw.fetch_add(1, std::memory_order_relaxed); else g_alWriteFail.fetch_add(1, std::memory_order_relaxed); }
+	if (fixP) { if (WriteT((uintptr_t)esp + 4, (float)bPitch)) g_alPitch.fetch_add(1, std::memory_order_relaxed); else g_alWriteFail.fetch_add(1, std::memory_order_relaxed); }
 }
 // F4 выключен: на следующем входе LookUpdate вернуть игровые коэффициенты
 static void RestoreWeights(uint32_t c)
@@ -1098,9 +1119,14 @@ static void LogFollowFixStats(const char* tag)
 		(unsigned long long)g_fxKept.load(), (unsigned long long)g_fxClobbered.load(), (double)g_fxLastW.load(), (double)g_fxLastDt30.load(), (double)g_fxLastF.load(),
 		(double)g_fxOrig13c.load(), (double)g_fxOrig140.load());
 	if (g_cfg.aimLinear)
-		Log("AimLinear stats (%s): calls=%llu fixedYaw=%llu fixedPitch=%llu skipStale=%llu skipModel=%llu writeFail=%llu | game's max gain multiplier seen: yaw x%.3f pitch x%.3f",
+	{
+		Log("AimLinear stats (%s): calls=%llu fixedYaw=%llu fixedPitch=%llu skipStale=%llu skipModel=%llu (yaw %llu, pitch %llu) writeFail=%llu | game's max gain multiplier seen (all frames): yaw x%.3f pitch x%.3f",
 			tag, (unsigned long long)g_alCalls.load(), (unsigned long long)g_alYaw.load(), (unsigned long long)g_alPitch.load(), (unsigned long long)g_alStale.load(),
-			(unsigned long long)g_alModel.load(), (unsigned long long)g_alWriteFail.load(), (double)g_alMaxMY.load(), (double)g_alMaxMP.load());
+			(unsigned long long)g_alModel.load(), (unsigned long long)g_alSkipYaw.load(), (unsigned long long)g_alSkipPitch.load(), (unsigned long long)g_alWriteFail.load(), (double)g_alMaxMY.load(), (double)g_alMaxMP.load());
+		Log("AimLinear gain histogram (<=1.05 / <=1.5 / <=2 / <=3 / <=4.05 / more): yaw %u %u %u %u %u %u | pitch %u %u %u %u %u %u",
+			g_alHistY[0].load(), g_alHistY[1].load(), g_alHistY[2].load(), g_alHistY[3].load(), g_alHistY[4].load(), g_alHistY[5].load(),
+			g_alHistP[0].load(), g_alHistP[1].load(), g_alHistP[2].load(), g_alHistP[3].load(), g_alHistP[4].load(), g_alHistP[5].load());
+	}
 }
 
 // ----------------------------------------------------------------------------
