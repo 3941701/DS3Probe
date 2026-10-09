@@ -94,7 +94,7 @@
 #ifndef DS3PROBE_GIT_SHA
 #define DS3PROBE_GIT_SHA "unknown"
 #endif
-#define DS3PROBE_VERSION "v4.6"
+#define DS3PROBE_VERSION "v4.7"
 
 namespace opt
 {
@@ -349,6 +349,7 @@ struct Config
 	double rawScale = 1.0;                       // не используется с v4 (RAW убран), ключ принимается для совместимости
 	bool followStart = false;                    // v4.5: FollowFix = 1 - обход сглаживания включён с запуска (без F4)
 	double followTauMs = 0.0;                    // v4.5: FollowTauMs - постоянная времени вместо оригинальных ~127 мс; 0 = мгновенно (вес 1)
+	double zeroGYaw = 1.0, zeroGPitch = 1.0;     // v4.7: ZeroGYaw / ZeroGPitch - множители выхода сглаживателя стика в невесомости (вызов из 0054F806); 1 = не трогать
 	double stickClamp = 0.0;                     // v4.6: StickClamp - постоянное значение клэмпа FUN_0040D820 this[3] (исходное 2.0); 0 = не трогать. F11 по-прежнему перекрывает ступенью
 	double diScale[3] = { 0.5, 0.25, 2.0 };      // множители режимов DI-xA / DI-xB / DI-xC
 	TraceCfg trace[opt::kMaxTracers];
@@ -585,6 +586,8 @@ static void LoadConfig()
 		else if (k == "beeps") flag(g_cfg.beeps);
 		else if (k == "followfix") flag(g_cfg.followStart);
 		else if (k == "stickclamp") { double d = 0; if (ParseDouble(v, &d) && d >= 0.0 && d <= 1.0e9) g_cfg.stickClamp = d; else CfgErr(ln, k, "expected a number in [0,1e9] (0 = leave the game value 2.0; 1e9 = no clamp)"); }
+		else if (k == "zerogyaw") { double d = 0; if (ParseDouble(v, &d) && d >= 0.1 && d <= 10.0) g_cfg.zeroGYaw = d; else CfgErr(ln, k, "expected a multiplier in [0.1,10] (1 = leave the game gain; 2.15 matches the ground yaw)"); }
+		else if (k == "zerogpitch") { double d = 0; if (ParseDouble(v, &d) && d >= 0.1 && d <= 10.0) g_cfg.zeroGPitch = d; else CfgErr(ln, k, "expected a multiplier in [0.1,10] (1 = leave the game gain)"); }
 		else if (k == "followtaums") { double d = 0; if (ParseDouble(v, &d) && d >= 0.0 && d <= 2000.0) g_cfg.followTauMs = d; else CfgErr(ln, k, "expected milliseconds in [0,2000] (0 = instant)"); }
 		else if (k == "rawscale") { double d = 0; if (ParseDouble(v, &d) && d > 0.0 && d < 100.0) g_cfg.rawScale = d; else CfgErr(ln, k, "expected a number in (0,100)"); }
 		else if (k == "offsens") { uintptr_t n = 0; if (ParseHex32(v, &n) && n < 0x10000) g_cfg.offSens = n; else CfgErr(ln, k, "expected hex offset < 0x10000"); }
@@ -907,6 +910,8 @@ static void __fastcall StickVirt_H(void* self, void* /*edx*/, uint32_t arg0, flo
 	OnStickVirt(self, arg0, x, y);
 }
 
+static const uintptr_t kZeroGSmoothRet = 0x0054F806;   // Ghidra-адрес возврата из FUN_0040D820 в коде свободного полёта (захват 20261009_204726: 1297 из 1297 вызовов)
+static std::atomic<uint64_t> g_zeroGScaled{ 0 };
 static uint32_t __fastcall StickSmooth_H(void* self, void* /*edx*/, float dt, float* x, float* y)
 {
 	void* const caller = _ReturnAddress(); // v4.1: настоящий вызывающий (в v4 колонка ret_hex была возвращаемым значением, а не адресом)
@@ -930,6 +935,20 @@ static uint32_t __fastcall StickSmooth_H(void* self, void* /*edx*/, float dt, fl
 		if (it != g_clampOrig.end()) { WriteT(sp + 0xC, it->second); g_clampOrig.erase(it); }
 	}
 	const uint32_t r = hkStickSmooth.unsafe_thiscall<uint32_t>(self, dt, x, y);
+	// v4.7: невесомость (свободный полёт) - отдельный вызывающий; усиление там 1.8326 рад/с на единицу стика по обеим осям
+	// против 3.94 (yaw) на земле. Масштабируем только выход (то, что получает ApplyRotDelta), состояние сглаживателя не трогаем.
+	if ((g_cfg.zeroGYaw != 1.0 || g_cfg.zeroGPitch != 1.0) && reinterpret_cast<uintptr_t>(caller) == Rebase(kZeroGSmoothRet))
+	{
+		float ox = 0, oy = 0;
+		if (ReadT(reinterpret_cast<uintptr_t>(x), &ox) && ReadT(reinterpret_cast<uintptr_t>(y), &oy) && FiniteF(ox, 1.0e9f) && FiniteF(oy, 1.0e9f))
+		{
+			WriteT(reinterpret_cast<uintptr_t>(x), (float)(ox * g_cfg.zeroGYaw));
+			WriteT(reinterpret_cast<uintptr_t>(y), (float)(oy * g_cfg.zeroGPitch));
+			if (g_zeroGScaled.fetch_add(1, std::memory_order_relaxed) == 0)
+				Log("ZeroG: smoother output scaled for the free-float camera (caller %08X): yaw x%.3f pitch x%.3f (first call: out (%.4f,%.4f) -> (%.4f,%.4f))",
+					(unsigned)kZeroGSmoothRet, g_cfg.zeroGYaw, g_cfg.zeroGPitch, (double)ox, (double)oy, (double)(ox * g_cfg.zeroGYaw), (double)(oy * g_cfg.zeroGPitch));
+		}
+	}
 	OnStickSmooth(self, dt, xin, yin, x, y, r, caller);
 	return r;
 }
@@ -1664,6 +1683,7 @@ static void StartCapture()
 		g_capMeta += "# roles:" + (rl.empty() ? std::string(" (none)") : rl) + "\n";
 		snprintf(b, sizeof(b), "# pointers ctrl=%08X camblock=%08X watch_on=%d\n", (unsigned)g_ctrlPtr.load(), (unsigned)g_camBlk.load(), (int)g_watchOn.load()); g_capMeta += b;
 	}
+	snprintf(b, sizeof(b), "# zerog_scale yaw=%g pitch=%g scaled_calls=%llu (smoother output multiplied for caller %08X; sticks.csv x_out/y_out are AFTER scaling)\n", g_cfg.zeroGYaw, g_cfg.zeroGPitch, (unsigned long long)g_zeroGScaled.load(), (unsigned)kZeroGSmoothRet); g_capMeta += b;
 	snprintf(b, sizeof(b), "# stickclamp_cfg=%g (0 = game value; F11 ladder overrides: openclamp level above)\n", g_cfg.stickClamp); g_capMeta += b;
 	snprintf(b, sizeof(b), "# followfix=%d tau_ms=%.1f (F4 smoothing bypass: ctrl+0x13C/0x140 rewritten each LookUpdate so the blend weight is 1 (tau 0) or 1-exp(-dt/tau); value at capture start, F4 may be toggled mid-capture)\n", (int)g_followFix.load(), g_cfg.followTauMs); g_capMeta += b;
 	g_capMeta += "# conditions: " + cond + "\n";
@@ -2477,6 +2497,7 @@ static DWORD WINAPI WorkerThread(LPVOID)
 	if (g_exeBase != g_imageBase) Log("WARNING: exe is loaded at %08X, not at its preferred base %08X; Rebase() assumes fixed addresses are shifted by the same delta", (unsigned)g_exeBase, (unsigned)g_imageBase);
 	LoadConfig();
 	if (g_cfg.stickClamp > 0.0) Log("cfg: StickClamp=%g -> FUN_0040D820 this[3] is set to it on every call (the game value is 2.0)", g_cfg.stickClamp);
+	if (g_cfg.zeroGYaw != 1.0 || g_cfg.zeroGPitch != 1.0) Log("cfg: ZeroGYaw=%.3f ZeroGPitch=%.3f -> free-float (zero-g) smoother output is multiplied (caller %08X)", g_cfg.zeroGYaw, g_cfg.zeroGPitch, (unsigned)kZeroGSmoothRet);
 	if (g_cfg.followStart) { g_followFix.store(true); Log("cfg: FollowFix=1 -> smoothing bypass ON from start (F4 toggles), FollowTauMs=%.1f", g_cfg.followTauMs); }
 	ResolveTargets();
 
