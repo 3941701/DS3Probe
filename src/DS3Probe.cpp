@@ -48,7 +48,10 @@
 //  9. Звук: F7 - 1 писк, F8 - 2 писка, F9 - 1/2/3 писка (PASS/RAW/ZERO), ошибка - низкий тон.
 //
 // Хоткеи (работают, только когда окно игры в фокусе):
-//   F4 - (v4.3) обход сглаживателя yaw/pitch контроллера камеры (нужны tracer role=ctrl/camblock/apply)
+//   F3 - (v4.4) ловец писателей: вкл/выкл аппаратные точки останова из ключей WatchN в cfg (кто пишет/читает поле)
+//   F4 - (v4.5) обход сглаживателя камеры: каждый кадр на входе LookUpdate (tracer role=ctrl) переписывает коэффициенты
+//        FUN_0074D6F0 ctrl+0x13C/0x140 так, чтобы вес смешивания (1-f)*ctrl+0x70 стал 1 (или по FollowTauMs из cfg);
+//        прежние версии (v4.3/v4.4) писали ctrl+0x40/0x44 - те пересчитываются в конце кадра и затирались
 //   F5 - (v4.2) метка "вижу рикошёт сейчас" в захвате
 //   F6 - маркер + таблица "кто вызывает user32"    F7/F8 - начало/конец захвата (CSV + итоги в лог)
 //   F9 - режим (см. B выше)                        F10   - условия опыта + список зарегистрированных raw-устройств
@@ -62,6 +65,7 @@
 #define NOMINMAX
 #include <Windows.h>
 #include <wincrypt.h>
+#include <TlHelp32.h>
 #include <intrin.h>
 
 #include <algorithm>
@@ -90,11 +94,12 @@
 #ifndef DS3PROBE_GIT_SHA
 #define DS3PROBE_GIT_SHA "unknown"
 #endif
-#define DS3PROBE_VERSION "v4.3"
+#define DS3PROBE_VERSION "v4.9"
 
 namespace opt
 {
-	constexpr int kVkFollow = VK_F4;   // v4.3: вкл/выкл обход сглаживателя yaw/pitch контроллера (опыт "follower bypass")
+	constexpr int kVkWatch  = VK_F3;   // v4.4: вкл/выкл ловец писателей (аппаратные точки останова)
+	constexpr int kVkFollow = VK_F4;   // v4.5: вкл/выкл обход сглаживания камеры (вес смешивания FUN_0073EF10 = 1)
 	constexpr int kVkBounce = VK_F5;   // v4.2: "вижу рикошёт прямо сейчас" - метка времени в захвате
 	constexpr int kVkMarker = VK_F6;
 	constexpr int kVkStart  = VK_F7;
@@ -334,6 +339,7 @@ struct CfgAddr  { bool set = false; uintptr_t v = 0; };
 struct CfgBytes { bool set = false; std::string v; };
 struct TraceCfg { CfgAddr addr; CfgBytes bytes; std::string name; int args = 6; int thisDwords = 8; int base = 0; std::vector<uint32_t> fields;
 	int dumpOff = 0; int dumpLen = 0; int dumpFrom = 0; int role = 0; }; // v4.2: dump = смещение (hex, может быть со знаком) и длина в байтах; dumpfrom = номер трассировщика, чей base брать за указатель (0 = свой)
+struct WatchCfg { bool set = false; int base = 0; uint32_t off = 0; int rw = 1; }; // v4.4: base 0=abs 1=ctrl 2=camblock; rw 1=запись, 3=чтение+запись
 struct Config
 {
 	std::wstring file;           // какой файл прочитан
@@ -341,8 +347,14 @@ struct Config
 	bool hasBuild = false; uint32_t build = 0; std::string md5;
 	bool exeHooks = true, anchor = true, beeps = true, stickHooks = true;
 	double rawScale = 1.0;                       // не используется с v4 (RAW убран), ключ принимается для совместимости
+	bool followStart = false;                    // v4.5: FollowFix = 1 - обход сглаживания включён с запуска (без F4)
+	double followTauMs = 0.0;                    // v4.5: FollowTauMs - постоянная времени вместо оригинальных ~127 мс; 0 = мгновенно (вес 1)
+	bool aimLinear = false;                      // v4.8: AimLinear = 1 - в прицеле поворот строго линейный (без "разгона" усиления до 2x); нужен трассировщик ApplyRotDelta с role = aimlin; работает, пока включён F4
+	double zeroGYaw = 1.0, zeroGPitch = 1.0;     // v4.7: ZeroGYaw / ZeroGPitch - множители выхода сглаживателя стика в невесомости (вызов из 0054F806); 1 = не трогать
+	double stickClamp = 0.0;                     // v4.6: StickClamp - постоянное значение клэмпа FUN_0040D820 this[3] (исходное 2.0); 0 = не трогать. F11 по-прежнему перекрывает ступенью
 	double diScale[3] = { 0.5, 0.25, 2.0 };      // множители режимов DI-xA / DI-xB / DI-xC
 	TraceCfg trace[opt::kMaxTracers];
+	WatchCfg watch[4];
 	uintptr_t offSens = 0x17C, offMouseState = 0x18C;
 	CfgAddr mgs, poll, wnd, mapper, accDX, accDY, flagCap, flagRc, virtW, virtH, mgrPtr, stickVirt, stickSmooth;
 	CfgBytes bMgs, bPoll, bWnd, bMapper, bStickVirt, bStickSmooth;
@@ -573,9 +585,28 @@ static void LoadConfig()
 		else if (k == "exehooks") flag(g_cfg.exeHooks);
 		else if (k == "anchor") flag(g_cfg.anchor);
 		else if (k == "beeps") flag(g_cfg.beeps);
+		else if (k == "followfix") flag(g_cfg.followStart);
+		else if (k == "aimlinear") flag(g_cfg.aimLinear);
+		else if (k == "stickclamp") { double d = 0; if (ParseDouble(v, &d) && d >= 0.0 && d <= 1.0e9) g_cfg.stickClamp = d; else CfgErr(ln, k, "expected a number in [0,1e9] (0 = leave the game value 2.0; 1e9 = no clamp)"); }
+		else if (k == "zerogyaw") { double d = 0; if (ParseDouble(v, &d) && d >= 0.1 && d <= 10.0) g_cfg.zeroGYaw = d; else CfgErr(ln, k, "expected a multiplier in [0.1,10] (1 = leave the game gain; 2.15 matches the ground yaw)"); }
+		else if (k == "zerogpitch") { double d = 0; if (ParseDouble(v, &d) && d >= 0.1 && d <= 10.0) g_cfg.zeroGPitch = d; else CfgErr(ln, k, "expected a multiplier in [0.1,10] (1 = leave the game gain)"); }
+		else if (k == "followtaums") { double d = 0; if (ParseDouble(v, &d) && d >= 0.0 && d <= 2000.0) g_cfg.followTauMs = d; else CfgErr(ln, k, "expected milliseconds in [0,2000] (0 = instant)"); }
 		else if (k == "rawscale") { double d = 0; if (ParseDouble(v, &d) && d > 0.0 && d < 100.0) g_cfg.rawScale = d; else CfgErr(ln, k, "expected a number in (0,100)"); }
 		else if (k == "offsens") { uintptr_t n = 0; if (ParseHex32(v, &n) && n < 0x10000) g_cfg.offSens = n; else CfgErr(ln, k, "expected hex offset < 0x10000"); }
 		else if (k == "offmousestate") { uintptr_t n = 0; if (ParseHex32(v, &n) && n < 0x10000) g_cfg.offMouseState = n; else CfgErr(ln, k, "expected hex offset < 0x10000"); }
+		else if (k.size() == 6 && k.compare(0, 5, "watch") == 0 && k[5] >= '1' && k[5] <= '4')
+		{
+			// WatchN = <abs|ctrl|camblock> <hex offset (для abs - полный адрес)> <w|rw>
+			std::istringstream is(v);
+			std::string b, o, m;
+			is >> b >> o >> m;
+			uintptr_t off = 0;
+			WatchCfg w;
+			b = Lower(b); m = Lower(m);
+			if (b == "abs") w.base = 0; else if (b == "ctrl") w.base = 1; else if (b == "camblock") w.base = 2; else w.base = -1;
+			if (w.base < 0 || !ParseHex32(o, &off) || (m != "w" && m != "rw") || (off & 3u)) CfgErr(ln, k, "expected '<abs|ctrl|camblock> <hex offset multiple of 4> <w|rw>', e.g. ctrl 44 w");
+			else { w.set = true; w.off = (uint32_t)off; w.rw = (m == "w") ? 1 : 3; g_cfg.watch[k[5] - '1'] = w; }
+		}
 		else
 		{
 			int ti = 0;
@@ -606,8 +637,8 @@ static void LoadConfig()
 			else if (sub == "role")
 			{
 				const std::string rv = Lower(v);
-				if (rv == "ctrl") g_cfg.trace[ti].role = 1; else if (rv == "camblock") g_cfg.trace[ti].role = 2; else if (rv == "apply") g_cfg.trace[ti].role = 3;
-				else CfgErr(ln, k, "expected ctrl|camblock|apply");
+				if (rv == "ctrl") g_cfg.trace[ti].role = 1; else if (rv == "camblock") g_cfg.trace[ti].role = 2; else if (rv == "apply") g_cfg.trace[ti].role = 3; else if (rv == "aimlin") g_cfg.trace[ti].role = 4;
+				else CfgErr(ln, k, "expected ctrl|camblock|apply|aimlin");
 			}
 			else CfgErr(ln, k, "unknown trace sub-key (bytes|name|args|this|base|fields|dump|dumpfrom|role)");
 		}
@@ -881,6 +912,12 @@ static void __fastcall StickVirt_H(void* self, void* /*edx*/, uint32_t arg0, flo
 	OnStickVirt(self, arg0, x, y);
 }
 
+static const uintptr_t kAimRotRet1 = 0x00552176, kAimRotRet2 = 0x00552222;   // v4.8: возвраты из ApplyRotDelta (FUN_00721BD0) в коде прицела
+static const uintptr_t kAimSmoothRet = 0x00549F2E;     // v4.8: Ghidra-адрес возврата из FUN_0040D820 в коде прицела
+static std::atomic<uint32_t> g_aimXBits{ 0 }, g_aimYBits{ 0 }, g_aimDtBits{ 0 };   // последний выход сглаживателя в прицеле (x, y, dt)
+static std::atomic<double> g_aimStamp{ -1.0e9 };                                  // NowMs() этого вызова
+static const uintptr_t kZeroGSmoothRet = 0x0054F806;   // Ghidra-адрес возврата из FUN_0040D820 в коде свободного полёта (захват 20261009_204726: 1297 из 1297 вызовов)
+static std::atomic<uint64_t> g_zeroGScaled{ 0 };
 static uint32_t __fastcall StickSmooth_H(void* self, void* /*edx*/, float dt, float* x, float* y)
 {
 	void* const caller = _ReturnAddress(); // v4.1: настоящий вызывающий (в v4 колонка ret_hex была возвращаемым значением, а не адресом)
@@ -889,10 +926,14 @@ static uint32_t __fastcall StickSmooth_H(void* self, void* /*edx*/, float dt, fl
 	ReadT(reinterpret_cast<uintptr_t>(y), &yin);
 	const uintptr_t sp = reinterpret_cast<uintptr_t>(self);
 	const int clampLvl = g_openClamp.load(std::memory_order_relaxed);
-	if (clampLvl > 0 && clampLvl <= kClampSteps) // F11: this[3] := ступень лестницы (исходное значение запоминаем)
+	// v4.6: приоритет - ступень F11, затем постоянное значение StickClamp из cfg, иначе исходное
+	float wantClamp = 0.0f;
+	if (clampLvl > 0 && clampLvl <= kClampSteps) wantClamp = kClampLadder[clampLvl - 1];
+	else if (g_cfg.stickClamp > 0.0) wantClamp = (float)g_cfg.stickClamp;
+	if (wantClamp > 0.0f) // this[3] := выбранное значение (исходное запоминаем)
 	{
 		if (g_clampOrig.find(sp) == g_clampOrig.end()) { float o = 0; if (ReadT(sp + 0xC, &o)) g_clampOrig[sp] = o; }
-		WriteT(sp + 0xC, kClampLadder[clampLvl - 1]);
+		WriteT(sp + 0xC, wantClamp);
 	}
 	else if (!g_clampOrig.empty())
 	{
@@ -900,6 +941,30 @@ static uint32_t __fastcall StickSmooth_H(void* self, void* /*edx*/, float dt, fl
 		if (it != g_clampOrig.end()) { WriteT(sp + 0xC, it->second); g_clampOrig.erase(it); }
 	}
 	const uint32_t r = hkStickSmooth.unsafe_thiscall<uint32_t>(self, dt, x, y);
+	// v4.7: невесомость (свободный полёт) - отдельный вызывающий; усиление там 1.8326 рад/с на единицу стика по обеим осям
+	// против 3.94 (yaw) на земле. Масштабируем только выход (то, что получает ApplyRotDelta), состояние сглаживателя не трогаем.
+	if ((g_cfg.zeroGYaw != 1.0 || g_cfg.zeroGPitch != 1.0) && reinterpret_cast<uintptr_t>(caller) == Rebase(kZeroGSmoothRet))
+	{
+		float ox = 0, oy = 0;
+		if (ReadT(reinterpret_cast<uintptr_t>(x), &ox) && ReadT(reinterpret_cast<uintptr_t>(y), &oy) && FiniteF(ox, 1.0e9f) && FiniteF(oy, 1.0e9f))
+		{
+			WriteT(reinterpret_cast<uintptr_t>(x), (float)(ox * g_cfg.zeroGYaw));
+			WriteT(reinterpret_cast<uintptr_t>(y), (float)(oy * g_cfg.zeroGPitch));
+			if (g_zeroGScaled.fetch_add(1, std::memory_order_relaxed) == 0)
+				Log("ZeroG: smoother output scaled for the free-float camera (caller %08X): yaw x%.3f pitch x%.3f (first call: out (%.4f,%.4f) -> (%.4f,%.4f))",
+					(unsigned)kZeroGSmoothRet, g_cfg.zeroGYaw, g_cfg.zeroGPitch, (double)ox, (double)oy, (double)(ox * g_cfg.zeroGYaw), (double)(oy * g_cfg.zeroGPitch));
+		}
+	}
+	if (reinterpret_cast<uintptr_t>(caller) == Rebase(kAimSmoothRet))   // v4.8: запомнить выход для AimLinearize (тот же кадр, ApplyRotDelta прицела идёт после)
+	{
+		float ox = 0, oy = 0;
+		if (ReadT(reinterpret_cast<uintptr_t>(x), &ox) && ReadT(reinterpret_cast<uintptr_t>(y), &oy))
+		{
+			uint32_t bx, by, bd; memcpy(&bx, &ox, 4); memcpy(&by, &oy, 4); memcpy(&bd, &dt, 4);
+			g_aimXBits.store(bx, std::memory_order_relaxed); g_aimYBits.store(by, std::memory_order_relaxed); g_aimDtBits.store(bd, std::memory_order_relaxed);
+			g_aimStamp.store(NowMs(), std::memory_order_release);
+		}
+	}
 	OnStickSmooth(self, dt, xin, yin, x, y, r, caller);
 	return r;
 }
@@ -922,25 +987,358 @@ struct TraceState
 	std::atomic<uint64_t> calls{ 0 };
 };
 static TraceState g_trace[opt::kMaxTracers];
-// v4.3: обход сглаживателя yaw/pitch контроллера LookUpdate. Данные сессии 223501: контроллер хранит свою пару углов
-// (this+0x40 pitch, this+0x44 yaw), которая каждый кадр догоняет угол камеры по кратчайшей дуге:
-//   x += 7.5*dt*wrap(target - x),  target_pitch = cam pitch,  target_yaw = atan2(m[0].x, m[0].z) - pi/2 (m = матрица блока камеры).
-// F4 каждый кадр (после фиксации поворота) принудительно ставит x := target, т.е. убирает отставание и перескоки.
+// v4.5: обход сглаживания камеры. Разбор FUN_0074D6F0 (внешний кадр камеры, ds3_range_0074D6C0): каждый кадр
+//   M = матрица(углы ctrl+0x44 yaw, +0x40 pitch, +0x48 roll);                 // 0074D834, углы - с прошлого кадра
+//   LookUpdate кладёт точную цель в блок камеры cam+0x20;                      // 0074D7D4
+//   R = FUN_0073EF10(M, (1-ctrl[0x140])*ctrl[0x70], (1-ctrl[0x13C])*ctrl[0x70]); // 0074DC60
+//   SetTransform(L, R) ... FUN_0074CF50(ctrl, L) пишет углы ctrl+0x40/0x44 обратно из L и считает положение камеры. // 0074DF1D
+// Значения в игре: ctrl[0x13C] = ctrl[0x140] = 0.75, ctrl[0x70] = 30*dt  =>  вес 0.25*30*dt = 7.5*dt, т.е. ровно
+// x(t+1) = x(t) + 7.5*dt*wrap(цель - x(t)) (на данных сессии 20261009_002857 невязка 3e-5 градуса).
+// F4 каждый кадр на входе LookUpdate (role=ctrl; раньше чтения этих полей в том же кадре) ставит f = 1 - w/ctrl[0x70],
+// где w = 1 (мгновенно) или 1-exp(-dt/tau) при FollowTauMs > 0. Так вес смешивания становится w, а не 0.1.
+// (v4.3/v4.4 писали сами углы ctrl+0x40/0x44 - они не состояние, а вывод FUN_0074CF50 в конце кадра, поэтому запись затиралась.)
 static std::atomic<bool> g_followFix{ false };
 static std::atomic<uint32_t> g_ctrlPtr{ 0 }, g_camBlk{ 0 };
 static std::atomic<uint64_t> g_followApplied{ 0 };
-static void ApplyFollowFix()
+// Диагностика: дошла ли запись, прочиталось ли записанное сразу, осталось ли нетронутым к следующему LookUpdate (kept)
+// или перезаписано игрой (clobbered).
+static std::atomic<uint64_t> g_fxCalls{ 0 }, g_fxSkipPtr{ 0 }, g_fxSkipRange{ 0 }, g_fxWriteFail{ 0 }, g_fxReadbackBad{ 0 };
+static std::atomic<uint64_t> g_fxKept{ 0 }, g_fxClobbered{ 0 };
+static std::atomic<uint32_t> g_fxLast13c{ 0 }, g_fxLast140{ 0 };
+static std::atomic<bool> g_fxHaveLast{ false };
+static std::atomic<bool> g_fxRestore{ false };
+static std::atomic<float> g_fxOrig13c{ 0.75f }, g_fxOrig140{ 0.75f };   // что игра держала в полях до нашей записи
+static std::atomic<float> g_fxLastW{ 0.0f }, g_fxLastDt30{ 0.0f }, g_fxLastF{ 0.0f };
+static std::atomic<uint64_t> g_ctrlCalls{ 0 };      // номер кадра (счётчик входов в LookUpdate)
+static uint32_t FBits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+static float WrapPi(float a) { while (a > 3.14159265f) a -= 6.28318531f; while (a < -3.14159265f) a += 6.28318531f; return a; }
+static void ApplyWeightFix(uint32_t c)
 {
-	const uint32_t c = g_ctrlPtr.load(), b = g_camBlk.load();
-	if (!PlausiblePtr(c) || !PlausiblePtr(b)) return;
-	float pitch = 0, m12 = 0, m14 = 0;
-	if (!ReadT((uintptr_t)b, &pitch) || !ReadT((uintptr_t)b + 0x10, &m12) || !ReadT((uintptr_t)b + 0x18, &m14)) return;
-	if (!(std::fabs(pitch) < 3.2f) || !(std::fabs(m12) <= 1.001f) || !(std::fabs(m14) <= 1.001f)) return;
-	float yaw = std::atan2(m12, m14) - 1.57079632679f;
-	if (yaw < -3.14159265f) yaw += 6.28318531f;
-	WriteT((uintptr_t)c + 0x40, pitch);
-	WriteT((uintptr_t)c + 0x44, yaw);
+	g_fxCalls.fetch_add(1, std::memory_order_relaxed);
+	if (!PlausiblePtr(c)) { g_fxSkipPtr.fetch_add(1, std::memory_order_relaxed); return; }
+	float dt30 = 0, f13 = 0, f14 = 0;
+	if (!ReadT((uintptr_t)c + 0x70, &dt30) || !ReadT((uintptr_t)c + 0x13C, &f13) || !ReadT((uintptr_t)c + 0x140, &f14)) { g_fxSkipPtr.fetch_add(1, std::memory_order_relaxed); return; }
+	if (!(dt30 > 0.05f && dt30 < 3.0f) || !std::isfinite(f13) || !std::isfinite(f14)) { g_fxSkipRange.fetch_add(1, std::memory_order_relaxed); return; }
+	if (g_fxHaveLast.load(std::memory_order_relaxed) && FBits(f13) == g_fxLast13c.load(std::memory_order_relaxed) && FBits(f14) == g_fxLast140.load(std::memory_order_relaxed))
+		g_fxKept.fetch_add(1, std::memory_order_relaxed);
+	else
+	{
+		if (g_fxHaveLast.load(std::memory_order_relaxed)) g_fxClobbered.fetch_add(1, std::memory_order_relaxed);
+		if (f13 >= 0.0f && f13 < 1.0f) g_fxOrig13c.store(f13, std::memory_order_relaxed);   // настоящие значения игры лежат в [0,1)
+		if (f14 >= 0.0f && f14 < 1.0f) g_fxOrig140.store(f14, std::memory_order_relaxed);
+	}
+	double w = 1.0;
+	if (g_cfg.followTauMs > 0.0) w = 1.0 - std::exp(-((double)dt30 / 30.0) * 1000.0 / g_cfg.followTauMs);   // dt = dt30/30 с
+	if (w > 1.0) w = 1.0;
+	if (w < 0.0) w = 0.0;
+	const float f = (float)(1.0 - w / (double)dt30);
+	if (!WriteT((uintptr_t)c + 0x13C, f) || !WriteT((uintptr_t)c + 0x140, f)) { g_fxWriteFail.fetch_add(1, std::memory_order_relaxed); return; }
+	float r13 = 0, r14 = 0;
+	if (!ReadT((uintptr_t)c + 0x13C, &r13) || !ReadT((uintptr_t)c + 0x140, &r14) || FBits(r13) != FBits(f) || FBits(r14) != FBits(f)) g_fxReadbackBad.fetch_add(1, std::memory_order_relaxed);
+	g_fxLast13c.store(FBits(f), std::memory_order_relaxed);
+	g_fxLast140.store(FBits(f), std::memory_order_relaxed);
+	g_fxHaveLast.store(true, std::memory_order_relaxed);
+	g_fxLastW.store((float)w, std::memory_order_relaxed);
+	g_fxLastDt30.store(dt30, std::memory_order_relaxed);
+	g_fxLastF.store(f, std::memory_order_relaxed);
 	g_followApplied.fetch_add(1, std::memory_order_relaxed);
+}
+// v4.8: прицел. ApplyRotDelta (FUN_00721BD0) зовётся из кода прицела с адресов возврата 00552176 (a0 = pitch, a1 = yaw) и 00552222 (a0 = pitch).
+// Данные 20261009_220909 (3597 кадров): a1 = -M_y * 100deg/s * x_out * dt, a0 = +M_p * 80deg/s * y_out * dt, где x_out/y_out - выход сглаживателя
+// того же кадра (вызов из 00549F2E), а M - "разгон" игры: растёт, пока стик > 1 (полное отклонение), и спадает ниже 1. Если x_out = 0, то a1 = 0
+// точно (0 исключений на 3597 кадрах), других слагаемых нет. Поэтому подменяем a0/a1 на M = 1.
+// v4.9: потолки M РАЗНЫЕ: yaw 2.0, pitch 4.0 (на 220909 M_p = 4.0000 на 36 кадрах из 1560, 2.15 превышен на всех этих кадрах). В v4.8 границы проверки были
+// [0.97, 2.15] для обеих осей (мой вывод "pitch не больше 1.7" был сделан по выборке, уже отфильтрованной этой границей), и кадры с M_p > 2.15 оставались с игровым
+// разгоном - скачок между M = 1 (подмена) и M до 4 (пропуск). Теперь каждая ось проверяется и подменяется отдельно, границы yaw [0.97, 2.5], pitch [0.97, 4.5].
+static std::atomic<uint64_t> g_alCalls{ 0 }, g_alYaw{ 0 }, g_alPitch{ 0 }, g_alStale{ 0 }, g_alModel{ 0 }, g_alWriteFail{ 0 }, g_alSkipYaw{ 0 }, g_alSkipPitch{ 0 };
+static std::atomic<float> g_alMaxMY{ 1.0f }, g_alMaxMP{ 1.0f };   // максимум отношения к базе по ВСЕМ кадрам, в том числе не прошедшим проверку
+static std::atomic<uint32_t> g_alHistY[6], g_alHistP[6];            // распределение M (<=1.05, <=1.5, <=2.0, <=3.0, <=4.05, больше) по всем кадрам с вычисленным M
+static std::atomic<int> g_alSkipLogged{ 0 };
+static const double kAimBaseYaw = 1.7453292519943295, kAimBasePitch = 1.3962634015954636;   // 100 и 80 градусов/с на единицу выхода сглаживателя
+static const double kAimYawLo = 0.97, kAimYawHi = 2.5, kAimPitchLo = 0.97, kAimPitchHi = 4.5;
+static inline int AimHistBucket(double m) { return m <= 1.05 ? 0 : (m <= 1.5 ? 1 : (m <= 2.0 ? 2 : (m <= 3.0 ? 3 : (m <= 4.05 ? 4 : 5)))); }
+static void AimLinearize(uint32_t esp, uint32_t ra)
+{
+	if (!g_cfg.aimLinear || !g_followFix.load(std::memory_order_relaxed)) return;
+	if (ra != (uint32_t)Rebase(kAimRotRet1) && ra != (uint32_t)Rebase(kAimRotRet2)) return;
+	g_alCalls.fetch_add(1, std::memory_order_relaxed);
+	if (NowMs() - g_aimStamp.load(std::memory_order_acquire) > 60.0) { g_alStale.fetch_add(1, std::memory_order_relaxed); return; }
+	const uint32_t bx = g_aimXBits.load(std::memory_order_relaxed), by = g_aimYBits.load(std::memory_order_relaxed), bd = g_aimDtBits.load(std::memory_order_relaxed);
+	float x, y, dt; memcpy(&x, &bx, 4); memcpy(&y, &by, 4); memcpy(&dt, &bd, 4);
+	float a0 = 0, a1 = 0;
+	if (!ReadT((uintptr_t)esp + 4, &a0) || !ReadT((uintptr_t)esp + 8, &a1) || !FiniteF(x, 1.0e6f) || !FiniteF(y, 1.0e6f) || !(dt > 0.0f && dt < 1.0f)) { g_alModel.fetch_add(1, std::memory_order_relaxed); return; }
+	const double bYaw = -kAimBaseYaw * (double)x * (double)dt, bPitch = kAimBasePitch * (double)y * (double)dt;
+	double my = 1.0, mp = 1.0; bool fixY = false, fixP = false, skip = false;
+	// |a| < 1e-6 - шум округления (во втором вызове при покое бывает ~1e-8), считаем нулём и не трогаем. Оси проверяются независимо.
+	if (std::fabs(a1) >= 1.0e-6f)
+	{
+		if (std::fabs(x) < 1.0e-6f) { skip = true; g_alSkipYaw.fetch_add(1, std::memory_order_relaxed); }
+		else
+		{
+			my = (double)a1 / bYaw;
+			MaxF(g_alMaxMY, (float)my); g_alHistY[AimHistBucket(my)].fetch_add(1, std::memory_order_relaxed);
+			if (my >= kAimYawLo && my <= kAimYawHi) fixY = true; else { skip = true; g_alSkipYaw.fetch_add(1, std::memory_order_relaxed); }
+		}
+		if (skip && g_alSkipLogged.fetch_add(1, std::memory_order_relaxed) < 16)
+			Log("AimLinear: yaw not fixed (ret %08X): x=%.5f y=%.5f dt=%.4f a1=%.6g a0=%.6g ratio=%.3f (allowed %.2f..%.2f)", ra, (double)x, (double)y, (double)dt, (double)a1, (double)a0, my, kAimYawLo, kAimYawHi);
+	}
+	if (std::fabs(a0) >= 1.0e-6f)
+	{
+		bool skipP = false;
+		if (std::fabs(y) < 1.0e-6f) skipP = true;
+		else
+		{
+			mp = (double)a0 / bPitch;
+			MaxF(g_alMaxMP, (float)mp); g_alHistP[AimHistBucket(mp)].fetch_add(1, std::memory_order_relaxed);
+			if (mp >= kAimPitchLo && mp <= kAimPitchHi) fixP = true; else skipP = true;
+		}
+		if (skipP)
+		{
+			skip = true; g_alSkipPitch.fetch_add(1, std::memory_order_relaxed);
+			if (g_alSkipLogged.fetch_add(1, std::memory_order_relaxed) < 16)
+				Log("AimLinear: pitch not fixed (ret %08X): x=%.5f y=%.5f dt=%.4f a1=%.6g a0=%.6g ratio=%.3f (allowed %.2f..%.2f)", ra, (double)x, (double)y, (double)dt, (double)a1, (double)a0, mp, kAimPitchLo, kAimPitchHi);
+		}
+	}
+	if (skip) g_alModel.fetch_add(1, std::memory_order_relaxed);
+	if (fixY) { if (WriteT((uintptr_t)esp + 8, (float)bYaw)) g_alYaw.fetch_add(1, std::memory_order_relaxed); else g_alWriteFail.fetch_add(1, std::memory_order_relaxed); }
+	if (fixP) { if (WriteT((uintptr_t)esp + 4, (float)bPitch)) g_alPitch.fetch_add(1, std::memory_order_relaxed); else g_alWriteFail.fetch_add(1, std::memory_order_relaxed); }
+}
+// F4 выключен: на следующем входе LookUpdate вернуть игровые коэффициенты
+static void RestoreWeights(uint32_t c)
+{
+	g_fxHaveLast.store(false, std::memory_order_relaxed);
+	if (!PlausiblePtr(c)) return;
+	WriteT((uintptr_t)c + 0x13C, g_fxOrig13c.load(std::memory_order_relaxed));
+	WriteT((uintptr_t)c + 0x140, g_fxOrig140.load(std::memory_order_relaxed));
+}
+static void LogFollowFixStats(const char* tag)
+{
+	Log("F4 stats (%s): on=%d tau_ms=%.1f calls=%llu applied=%llu skipPtr=%llu skipRange=%llu writeFail=%llu readbackBad=%llu | next-frame kept=%llu clobbered=%llu | last w=%.4f dt30=%.3f f=%.4f | game orig 13c=%.3f 140=%.3f",
+		tag, (int)g_followFix.load(), g_cfg.followTauMs, (unsigned long long)g_fxCalls.load(), (unsigned long long)g_followApplied.load(), (unsigned long long)g_fxSkipPtr.load(),
+		(unsigned long long)g_fxSkipRange.load(), (unsigned long long)g_fxWriteFail.load(), (unsigned long long)g_fxReadbackBad.load(),
+		(unsigned long long)g_fxKept.load(), (unsigned long long)g_fxClobbered.load(), (double)g_fxLastW.load(), (double)g_fxLastDt30.load(), (double)g_fxLastF.load(),
+		(double)g_fxOrig13c.load(), (double)g_fxOrig140.load());
+	if (g_cfg.aimLinear)
+	{
+		Log("AimLinear stats (%s): calls=%llu fixedYaw=%llu fixedPitch=%llu skipStale=%llu skipModel=%llu (yaw %llu, pitch %llu) writeFail=%llu | game's max gain multiplier seen (all frames): yaw x%.3f pitch x%.3f",
+			tag, (unsigned long long)g_alCalls.load(), (unsigned long long)g_alYaw.load(), (unsigned long long)g_alPitch.load(), (unsigned long long)g_alStale.load(),
+			(unsigned long long)g_alModel.load(), (unsigned long long)g_alSkipYaw.load(), (unsigned long long)g_alSkipPitch.load(), (unsigned long long)g_alWriteFail.load(), (double)g_alMaxMY.load(), (double)g_alMaxMP.load());
+		Log("AimLinear gain histogram (<=1.05 / <=1.5 / <=2 / <=3 / <=4.05 / more): yaw %u %u %u %u %u %u | pitch %u %u %u %u %u %u",
+			g_alHistY[0].load(), g_alHistY[1].load(), g_alHistY[2].load(), g_alHistY[3].load(), g_alHistY[4].load(), g_alHistY[5].load(),
+			g_alHistP[0].load(), g_alHistP[1].load(), g_alHistP[2].load(), g_alHistP[3].load(), g_alHistP[4].load(), g_alHistP[5].load());
+	}
+}
+
+// ----------------------------------------------------------------------------
+// v4.4: ловец писателей. Аппаратные точки останова (DR0..DR3) на поля объекта-контроллера / блока камеры: кто пишет
+// (или читает) эти слова. Результат - адреса инструкций (exe+..., ghidra ...) и стек вызовов. F3 вкл/выкл.
+// Точки ставятся на все потоки процесса (кроме нашего), перевзвод раз в ~1 с (на случай переезда объектов и новых потоков).
+// ----------------------------------------------------------------------------
+struct WatchHit
+{
+	std::atomic<uint32_t> eip{ 0 };       // публикуется последним; 0 = слот свободен
+	int watch = 0;                        // 0..3
+	uint32_t tid = 0, val = 0, stk[6] = {};
+	uint32_t regs[7] = {};                // eax ebx ecx edx esi edi ebp в момент ловушки
+	uint32_t snap[7][12] = {};            // по 12 dword от каждого регистра, похожего на указатель (иначе нули)
+	uint8_t code[16] = {};                // байты по адресу eip (для ключа TraceN.bytes, если захочется поставить mid-хук сюда)
+	uint64_t firstFrame = 0, lastFrame = 0;
+	std::atomic<uint64_t> count{ 0 };
+};
+static WatchHit g_hits[64];
+static std::atomic<int> g_hitN{ 0 };
+static std::atomic<bool> g_watchOn{ false };
+static std::atomic<uint32_t> g_watchAddr[4] = {};   // реально взведённые адреса (для разбора в обработчике)
+static PVOID g_vehHandle = nullptr;
+
+static LONG CALLBACK WatchVeh(PEXCEPTION_POINTERS ep)
+{
+	if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+	CONTEXT* c = ep->ContextRecord;
+	const DWORD dr6 = c->Dr6;
+	if (!(dr6 & 0xF)) return EXCEPTION_CONTINUE_SEARCH; // не наша ловушка
+	const uint32_t eip = (uint32_t)c->Eip;
+	for (int i = 0; i < 4; ++i)
+	{
+		if (!(dr6 & (1u << i))) continue;
+		WatchHit* h = nullptr;
+		const int n = g_hitN.load(std::memory_order_acquire);
+		for (int k = 0; k < n && k < 64; ++k)
+			if (g_hits[k].eip.load(std::memory_order_acquire) == eip && g_hits[k].watch == i) { h = &g_hits[k]; break; }
+		const uint64_t fr = g_ctrlCalls.load(std::memory_order_relaxed);
+		uint32_t val = 0;
+		const uint32_t a = g_watchAddr[i].load(std::memory_order_relaxed);
+		// НЕЛЬЗЯ читать наблюдаемый адрес, если точка ловит и чтение (rw): чтение внутри обработчика даст новую ловушку -> рекурсия -> вылет
+		if (a && g_cfg.watch[i].rw == 1) ReadT((uintptr_t)a, &val);
+		if (!h)
+		{
+			const int idx = g_hitN.fetch_add(1, std::memory_order_acq_rel);
+			if (idx >= 64) { g_hitN.store(64); continue; }
+			h = &g_hits[idx];
+			h->watch = i; h->tid = GetCurrentThreadId(); h->firstFrame = fr;
+			int got = 0;
+			for (int q = 0; q < 64 && got < 6; ++q)
+			{
+				uint32_t v = 0;
+				if (!ReadT((uintptr_t)c->Esp + 4u * q, &v)) break;
+				if (InImage(v)) h->stk[got++] = v;
+			}
+			h->regs[0] = (uint32_t)c->Eax; h->regs[1] = (uint32_t)c->Ebx; h->regs[2] = (uint32_t)c->Ecx; h->regs[3] = (uint32_t)c->Edx;
+			h->regs[4] = (uint32_t)c->Esi; h->regs[5] = (uint32_t)c->Edi; h->regs[6] = (uint32_t)c->Ebp;
+			for (int r = 0; r < 7; ++r)
+				if (PlausiblePtr(h->regs[r])) ReadBytes((uintptr_t)h->regs[r], h->snap[r], sizeof(h->snap[r]));
+			ReadBytes((uintptr_t)eip, h->code, sizeof(h->code));
+			h->eip.store(eip, std::memory_order_release);
+		}
+		h->lastFrame = fr; h->val = val;
+		h->count.fetch_add(1, std::memory_order_relaxed);
+	}
+	c->Dr6 = 0;
+	return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static bool SetDebugRegsOnThread(DWORD tid, const uint32_t addr[4], const int rw[4])
+{
+	HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+	if (!h) return false;
+	bool ok = false;
+	if (SuspendThread(h) != (DWORD)-1) // между Suspend и Resume не выделяем память и не пишем в лог (возможна блокировка)
+	{
+		CONTEXT c = {};
+		c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+		if (GetThreadContext(h, &c))
+		{
+			DWORD dr7 = 0;
+			DWORD* regs[4] = { &c.Dr0, &c.Dr1, &c.Dr2, &c.Dr3 };
+			for (int i = 0; i < 4; ++i)
+			{
+				*regs[i] = addr[i];
+				if (addr[i]) dr7 |= (1u << (2 * i)) | ((DWORD)rw[i] << (16 + 4 * i)) | (3u << (18 + 4 * i));
+			}
+			c.Dr6 = 0;
+			c.Dr7 = dr7;
+			ok = SetThreadContext(h, &c) != 0;
+		}
+		ResumeThread(h);
+	}
+	CloseHandle(h);
+	return ok;
+}
+
+// ставит (addr != 0) или снимает (все 0) точки на всех потоках, кроме текущего; возвращает число успешных потоков
+static int SetDebugRegsAllThreads(const uint32_t addr[4], const int rw[4], int* total)
+{
+	int okN = 0, all = 0;
+	const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	if (snap != INVALID_HANDLE_VALUE)
+	{
+		THREADENTRY32 te = {};
+		te.dwSize = sizeof(te);
+		for (BOOL r = Thread32First(snap, &te); r; r = Thread32Next(snap, &te))
+		{
+			if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+			++all;
+			if (SetDebugRegsOnThread(te.th32ThreadID, addr, rw)) ++okN;
+		}
+		CloseHandle(snap);
+	}
+	if (total) *total = all;
+	return okN;
+}
+
+static int g_watchLogged = 0;          // сколько записей g_hits уже выведено в лог (первое появление)
+static uint32_t g_watchArmedAddr[4] = {};
+static int g_watchArmedRw[4] = {};
+
+static uint32_t WatchResolve(int i)
+{
+	const WatchCfg& w = g_cfg.watch[i];
+	if (!w.set) return 0;
+	uint32_t base = 0;
+	if (w.base == 1) base = g_ctrlPtr.load(); else if (w.base == 2) base = g_camBlk.load();
+	if (w.base != 0 && !PlausiblePtr(base)) return 0;
+	const uint32_t a = base + w.off;
+	return (PlausiblePtr(a) && !(a & 3u)) ? a : 0;
+}
+
+// (пере)взвод по текущим указателям; вызывается из рабочего потока
+static void WatchRearm(bool force, const char* why)
+{
+	uint32_t addr[4] = {}; int rw[4] = {};
+	bool any = false, changed = force;
+	for (int i = 0; i < 4; ++i)
+	{
+		addr[i] = WatchResolve(i); rw[i] = g_cfg.watch[i].rw;
+		if (addr[i]) any = true;
+		if (addr[i] != g_watchArmedAddr[i]) changed = true;
+	}
+	if (!changed) return;
+	if (!g_vehHandle) g_vehHandle = AddVectoredExceptionHandler(1, &WatchVeh);
+	for (int i = 0; i < 4; ++i) g_watchAddr[i].store(addr[i], std::memory_order_relaxed);
+	int total = 0;
+	const int ok = SetDebugRegsAllThreads(addr, rw, &total);
+	memcpy(g_watchArmedAddr, addr, sizeof(addr)); memcpy(g_watchArmedRw, rw, sizeof(rw));
+	Log("watch: %s -> %d/%d threads armed; DR0..3 = %08X %08X %08X %08X%s", why, ok, total, (unsigned)addr[0], (unsigned)addr[1], (unsigned)addr[2], (unsigned)addr[3], any ? "" : " (no addresses resolved yet: need roles ctrl/camblock and WatchN keys)");
+}
+
+static void WatchFlushLog(bool summary)
+{
+	const int n = std::min(g_hitN.load(std::memory_order_acquire), 64);
+	for (int k = 0; k < n; ++k)
+	{
+		WatchHit& h = g_hits[k];
+		const uint32_t eip = h.eip.load(std::memory_order_acquire);
+		if (!eip) continue;
+		if (!summary && k < g_watchLogged) continue;
+		char b[512];
+		std::string s;
+		for (int q = 0; q < 6 && h.stk[q]; ++q) { snprintf(b, sizeof(b), " %s", Where(reinterpret_cast<void*>((uintptr_t)h.stk[q])).c_str()); s += b; }
+		if (!summary)
+		{
+			static const char* kRn[7] = { "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp" };
+			std::string cs;
+			for (int q = 0; q < 16; ++q) { snprintf(b, sizeof(b), "%s%02X", q ? " " : "", (unsigned)h.code[q]); cs += b; }
+			Log("watch-code W%d eip=%08X bytes: %s", h.watch + 1, (unsigned)eip, cs.c_str());
+			for (int r = 0; r < 7; ++r)
+			{
+				std::string ws;
+				for (int q = 0; q < 12; ++q) { snprintf(b, sizeof(b), " %08X(%.4g)", (unsigned)h.snap[r][q], (double)BitsToF(h.snap[r][q])); ws += b; }
+				Log("watch-reg W%d %s=%08X%s", h.watch + 1, kRn[r], (unsigned)h.regs[r], PlausiblePtr(h.regs[r]) ? ws.c_str() : " (not a pointer)");
+			}
+		}
+		const WatchCfg& w = g_cfg.watch[h.watch];
+		Log("watch%s W%d (%s %s+0x%X) eip=%s tid=%u count=%llu frames=%llu..%llu lastvalue=%08X(%.6g) stack(exe):%s", summary ? "-summary" : "-new", h.watch + 1, w.rw == 1 ? "write" : "read/write",
+			w.base == 1 ? "ctrl" : (w.base == 2 ? "camblock" : "abs"), (unsigned)w.off, Where(reinterpret_cast<void*>((uintptr_t)eip)).c_str(), (unsigned)h.tid,
+			(unsigned long long)h.count.load(), (unsigned long long)h.firstFrame, (unsigned long long)h.lastFrame, (unsigned)h.val, (double)BitsToF(h.val), s.c_str());
+	}
+	if (!summary) g_watchLogged = n;
+}
+
+static void WatchToggle()
+{
+	if (!g_watchOn.load())
+	{
+		bool any = false;
+		for (int i = 0; i < 4; ++i) any = any || g_cfg.watch[i].set;
+		if (!any) { Log("=== F3: no Watch1..Watch4 keys in cfg -> nothing to arm ==="); return; }
+		g_watchOn.store(true);
+		memset(g_watchArmedAddr, 0, sizeof(g_watchArmedAddr));
+		Log("=== F3: writer catcher ON ===");
+		WatchRearm(true, "arm");
+	}
+	else
+	{
+		g_watchOn.store(false);
+		const uint32_t z[4] = {}; const int rz[4] = {};
+		for (int i = 0; i < 4; ++i) g_watchAddr[i].store(0);
+		int total = 0;
+		const int ok = SetDebugRegsAllThreads(z, rz, &total);
+		memset(g_watchArmedAddr, 0, sizeof(g_watchArmedAddr));
+		Log("=== F3: writer catcher OFF (%d/%d threads cleared) ===", ok, total);
+		WatchFlushLog(false);
+		WatchFlushLog(true);
+	}
 }
 static SafetyHookMid g_traceHooks[opt::kMaxTracers];
 
@@ -966,12 +1364,17 @@ static void OnTrace(int id, safetyhook::Context& ctx)
 	const uint32_t ecx = (uint32_t)ctx.ecx, edx = (uint32_t)ctx.edx, esp = (uint32_t)ctx.esp, eax = (uint32_t)ctx.eax;
 	const uint32_t bv = CtxReg(ctx, ts.base);
 	ts.lastBase.store(bv, std::memory_order_relaxed);
-	if (ts.role == 1) g_ctrlPtr.store(bv, std::memory_order_relaxed);
-	else if (ts.role == 2) g_camBlk.store(bv, std::memory_order_relaxed);
-	else if (ts.role == 3 && g_followFix.load(std::memory_order_relaxed)) ApplyFollowFix();
+	if (ts.role == 1)
+	{
+		g_ctrlPtr.store(bv, std::memory_order_relaxed); g_ctrlCalls.fetch_add(1, std::memory_order_relaxed);
+		if (g_followFix.load(std::memory_order_relaxed)) ApplyWeightFix(bv);
+		else if (g_fxRestore.exchange(false, std::memory_order_relaxed)) RestoreWeights(bv);
+	}
+	else if (ts.role == 2) g_camBlk.store(bv, std::memory_order_relaxed);   // role=apply (3) в v4.5 не нужна: запись идёт на входе LookUpdate
 	uint32_t ra = 0, a[8] = {}, th[16] = {}, fv[16] = {};
 	ReadT(esp, &ra); // на входе функции это адрес возврата; для хука посреди функции - просто dword на вершине стека
-	if (ts.args > 0) ReadBytes(esp + 4, a, sizeof(uint32_t) * (size_t)ts.args);
+	if (ts.args > 0) ReadBytes(esp + 4, a, sizeof(uint32_t) * (size_t)ts.args);   // в CSV остаются исходные значения аргументов (до подмены AimLinear)
+	if (ts.role == 4) AimLinearize(esp, ra);
 	if (ts.thisDw > 0 && PlausiblePtr(bv)) ReadBytes(bv, th, sizeof(uint32_t) * (size_t)ts.thisDw);
 	if (PlausiblePtr(bv))
 		for (size_t i = 0; i < ts.fields.size() && i < 16; ++i) ReadT((uintptr_t)bv + ts.fields[i], &fv[i]);
@@ -1359,7 +1762,17 @@ static void StartCapture()
 			}
 			g_capMeta += "\n";
 		} }
-	snprintf(b, sizeof(b), "# followfix=%d (F4 follower bypass; 1 = controller yaw/pitch forced to target each frame)\n", (int)g_followFix.load()); g_capMeta += b;
+	{
+		std::string rl;
+		for (int i = 0; i < opt::kMaxTracers; ++i)
+			if (g_trace[i].on && g_trace[i].role) { snprintf(b, sizeof(b), " trace%d=%s", i + 1, g_trace[i].role == 1 ? "ctrl" : (g_trace[i].role == 2 ? "camblock" : (g_trace[i].role == 3 ? "apply" : "aimlin"))); rl += b; }
+		g_capMeta += "# roles:" + (rl.empty() ? std::string(" (none)") : rl) + "\n";
+		snprintf(b, sizeof(b), "# pointers ctrl=%08X camblock=%08X watch_on=%d\n", (unsigned)g_ctrlPtr.load(), (unsigned)g_camBlk.load(), (int)g_watchOn.load()); g_capMeta += b;
+	}
+	snprintf(b, sizeof(b), "# zerog_scale yaw=%g pitch=%g scaled_calls=%llu (smoother output multiplied for caller %08X; sticks.csv x_out/y_out are AFTER scaling)\n", g_cfg.zeroGYaw, g_cfg.zeroGPitch, (unsigned long long)g_zeroGScaled.load(), (unsigned)kZeroGSmoothRet); g_capMeta += b;
+	snprintf(b, sizeof(b), "# aimlinear cfg=%d active=%d (trace args a0/a1 of ApplyRotDelta at 00552176/00552222 are the ORIGINAL game values; the camera gets M=1 instead) fixedYaw=%llu fixedPitch=%llu\n", (int)g_cfg.aimLinear, (int)(g_cfg.aimLinear && g_followFix.load()), (unsigned long long)g_alYaw.load(), (unsigned long long)g_alPitch.load()); g_capMeta += b;
+	snprintf(b, sizeof(b), "# stickclamp_cfg=%g (0 = game value; F11 ladder overrides: openclamp level above)\n", g_cfg.stickClamp); g_capMeta += b;
+	snprintf(b, sizeof(b), "# followfix=%d tau_ms=%.1f (F4 smoothing bypass: ctrl+0x13C/0x140 rewritten each LookUpdate so the blend weight is 1 (tau 0) or 1-exp(-dt/tau); value at capture start, F4 may be toggled mid-capture)\n", (int)g_followFix.load(), g_cfg.followTauMs); g_capMeta += b;
 	g_capMeta += "# conditions: " + cond + "\n";
 
 	g_capStart = NowMs();
@@ -1607,6 +2020,14 @@ static void StopCapture()
 		snprintf(b, sizeof(b), "# raw_reference=%s raw_events_in_capture=%llu last_raw_event_age_s=%.1f\n", alive ? "alive" : "DEAD", (unsigned long long)ev,
 			last >= 0 ? (NowMs() - last) / 1000.0 : -1.0);
 		g_capMetaTail = b;
+		{
+			char f4[400];
+			snprintf(f4, sizeof(f4), "# f4_stats on=%d calls=%llu applied=%llu skipPtr=%llu skipRange=%llu writeFail=%llu readbackBad=%llu kept=%llu clobbered=%llu (whole run, not per capture)\n",
+				(int)g_followFix.load(), (unsigned long long)g_fxCalls.load(), (unsigned long long)g_followApplied.load(), (unsigned long long)g_fxSkipPtr.load(), (unsigned long long)g_fxSkipRange.load(),
+				(unsigned long long)g_fxWriteFail.load(), (unsigned long long)g_fxReadbackBad.load(), (unsigned long long)g_fxKept.load(), (unsigned long long)g_fxClobbered.load());
+			g_capMetaTail += f4;
+		}
+		LogFollowFixStats("capture stop");
 		Log("  raw reference: %s", b + 2);
 	}
 	LogRegisteredRaw("capture stop");
@@ -2144,7 +2565,7 @@ static void ToggleOpenClamp()
 	const int lvl = (g_openClamp.load() + 1) % (kClampSteps + 1);
 	g_openClamp = lvl;
 	if (lvl == 0)
-		Log("=== F11: clamp ladder level 0/%d: FUN_0040D820 this[3] := original value ===", kClampSteps);
+		Log("=== F11: clamp ladder level 0/%d: FUN_0040D820 this[3] := %s ===", kClampSteps, g_cfg.stickClamp > 0.0 ? "the StickClamp value from the cfg" : "original value");
 	else
 		Log("=== F11: clamp ladder level %d/%d: FUN_0040D820 this[3] := %g on every call (the original is restored at level 0) ===", lvl, kClampSteps, (double)kClampLadder[lvl - 1]);
 	Tone(lvl == 0 ? 1 : 2, lvl == 0 ? 500 : 900 + 300 * lvl);
@@ -2162,11 +2583,15 @@ static DWORD WINAPI WorkerThread(LPVOID)
 		(unsigned)g_timeDateStamp, (unsigned)g_sizeOfImage, (unsigned)g_imageBase, (unsigned)g_exeBase);
 	if (g_exeBase != g_imageBase) Log("WARNING: exe is loaded at %08X, not at its preferred base %08X; Rebase() assumes fixed addresses are shifted by the same delta", (unsigned)g_exeBase, (unsigned)g_imageBase);
 	LoadConfig();
+	if (g_cfg.stickClamp > 0.0) Log("cfg: StickClamp=%g -> FUN_0040D820 this[3] is set to it on every call (the game value is 2.0)", g_cfg.stickClamp);
+	if (g_cfg.zeroGYaw != 1.0 || g_cfg.zeroGPitch != 1.0) Log("cfg: ZeroGYaw=%.3f ZeroGPitch=%.3f -> free-float (zero-g) smoother output is multiplied (caller %08X)", g_cfg.zeroGYaw, g_cfg.zeroGPitch, (unsigned)kZeroGSmoothRet);
+	if (g_cfg.aimLinear) Log("cfg: AimLinear=1 -> aim rotation is made linear (the game's 1x..2x gain ramp is removed) while F4 is ON; needs a tracer on ApplyRotDelta 00721BD0 with role = aimlin");
+	if (g_cfg.followStart) { g_followFix.store(true); Log("cfg: FollowFix=1 -> smoothing bypass ON from start (F4 toggles), FollowTauMs=%.1f", g_cfg.followTauMs); }
 	ResolveTargets();
 
 	const double t0 = NowMs();
 	double nextSec = t0 + 1000.0, d3d9Seen = -1.0;
-	bool k4 = false, k5 = false, k6 = false, k7 = false, k8 = false, k9 = false, k10 = false, k11 = false;
+	bool k3 = false, k4 = false, k5 = false, k6 = false, k7 = false, k8 = false, k9 = false, k10 = false, k11 = false;
 	int marker = 0;
 
 	for (;;)
@@ -2184,16 +2609,21 @@ static DWORD WINAPI WorkerThread(LPVOID)
 		if (g_mode.load() != M_PASS && now - g_modeSince.load() > opt::kModeAutoRevertMs) { SetMode(M_PASS, "auto-revert after 2 min"); Tone(1, 300); }
 
 		const bool fg = GameFocused();
+		const bool n3 = fg && KeyDown(opt::kVkWatch);
 		const bool n4 = fg && KeyDown(opt::kVkFollow);
 		const bool n5 = fg && KeyDown(opt::kVkBounce);
 		const bool n6 = fg && KeyDown(opt::kVkMarker), n7 = fg && KeyDown(opt::kVkStart), n8 = fg && KeyDown(opt::kVkStop);
 		const bool n9 = fg && KeyDown(opt::kVkMode), n10 = fg && KeyDown(opt::kVkInfo), n11 = fg && KeyDown(opt::kVkOpen);
+		if (n3 && !k3) { WatchToggle(); Tone(g_watchOn.load() ? 2 : 1, g_watchOn.load() ? 1300 : 500); }
 		if (n4 && !k4)
 		{
 			const bool on = !g_followFix.load();
+			if (on) g_fxHaveLast.store(false);
+			else g_fxRestore.store(true);
 			g_followFix.store(on);
-			Log("=== F4: follower bypass %s (ctrl=%08X camblock=%08X applied so far=%llu) ===", on ? "ON" : "OFF", (unsigned)g_ctrlPtr.load(), (unsigned)g_camBlk.load(), (unsigned long long)g_followApplied.load());
-			if (on && (!g_ctrlPtr.load() || !g_camBlk.load())) Log("  F4: pointers not known yet (need tracers with role=ctrl and role=camblock, and role=apply) - nothing will be written");
+			Log("=== F4: smoothing bypass %s (ctrl=%08X tau_ms=%.1f applied so far=%llu) ===", on ? "ON" : "OFF", (unsigned)g_ctrlPtr.load(), g_cfg.followTauMs, (unsigned long long)g_followApplied.load());
+			if (on && !g_ctrlPtr.load()) Log("  F4: ctrl pointer not known yet (need a tracer with role=ctrl on LookUpdate 0073F310) - nothing will be written");
+			if (!on) LogFollowFixStats("F4 off");
 			Tone(on ? 2 : 1, on ? 1500 : 500);
 		}
 		if (n5 && !k5)
@@ -2213,9 +2643,17 @@ static DWORD WINAPI WorkerThread(LPVOID)
 		if (n9 && !k9) CycleMode();
 		if (n10 && !k10) { LogConditions("F10"); LogRegisteredRaw("F10"); }
 		if (n11 && !k11) ToggleOpenClamp();
-		k4 = n4; k5 = n5; k6 = n6; k7 = n7; k8 = n8; k9 = n9; k10 = n10; k11 = n11;
+		k3 = n3; k4 = n4; k5 = n5; k6 = n6; k7 = n7; k8 = n8; k9 = n9; k10 = n10; k11 = n11;
 
-		if (now >= nextSec) { nextSec += 1000.0; PrintSecond(); }
+		if (now >= nextSec)
+		{
+			nextSec += 1000.0;
+			PrintSecond();
+			static int sec = 0;
+			++sec;
+			if (g_watchOn.load()) { WatchRearm(false, "re-arm (pointers changed)"); WatchFlushLog(false); if (sec % 10 == 0) WatchFlushLog(true); }
+			if (g_followFix.load() && sec % 5 == 0) LogFollowFixStats("periodic");
+		}
 	}
 }
 
