@@ -49,8 +49,9 @@
 //
 // Хоткеи (работают, только когда окно игры в фокусе):
 //   F3 - (v4.4) ловец писателей: вкл/выкл аппаратные точки останова из ключей WatchN в cfg (кто пишет/читает поле)
-//   F4 - (v4.3) обход сглаживателя yaw/pitch контроллера камеры (нужны tracer role=ctrl/camblock/apply);
-//        v4.4: диагностика записи (счётчики, значения до/после, "затёрто ли" на следующем кадре)
+//   F4 - (v4.5) обход сглаживателя камеры: каждый кадр на входе LookUpdate (tracer role=ctrl) переписывает коэффициенты
+//        FUN_0074D6F0 ctrl+0x13C/0x140 так, чтобы вес смешивания (1-f)*ctrl+0x70 стал 1 (или по FollowTauMs из cfg);
+//        прежние версии (v4.3/v4.4) писали ctrl+0x40/0x44 - те пересчитываются в конце кадра и затирались
 //   F5 - (v4.2) метка "вижу рикошёт сейчас" в захвате
 //   F6 - маркер + таблица "кто вызывает user32"    F7/F8 - начало/конец захвата (CSV + итоги в лог)
 //   F9 - режим (см. B выше)                        F10   - условия опыта + список зарегистрированных raw-устройств
@@ -93,12 +94,12 @@
 #ifndef DS3PROBE_GIT_SHA
 #define DS3PROBE_GIT_SHA "unknown"
 #endif
-#define DS3PROBE_VERSION "v4.4"
+#define DS3PROBE_VERSION "v4.5"
 
 namespace opt
 {
 	constexpr int kVkWatch  = VK_F3;   // v4.4: вкл/выкл ловец писателей (аппаратные точки останова)
-	constexpr int kVkFollow = VK_F4;   // v4.3: вкл/выкл обход сглаживателя yaw/pitch контроллера (опыт "follower bypass")
+	constexpr int kVkFollow = VK_F4;   // v4.5: вкл/выкл обход сглаживания камеры (вес смешивания FUN_0073EF10 = 1)
 	constexpr int kVkBounce = VK_F5;   // v4.2: "вижу рикошёт прямо сейчас" - метка времени в захвате
 	constexpr int kVkMarker = VK_F6;
 	constexpr int kVkStart  = VK_F7;
@@ -346,6 +347,8 @@ struct Config
 	bool hasBuild = false; uint32_t build = 0; std::string md5;
 	bool exeHooks = true, anchor = true, beeps = true, stickHooks = true;
 	double rawScale = 1.0;                       // не используется с v4 (RAW убран), ключ принимается для совместимости
+	bool followStart = false;                    // v4.5: FollowFix = 1 - обход сглаживания включён с запуска (без F4)
+	double followTauMs = 0.0;                    // v4.5: FollowTauMs - постоянная времени вместо оригинальных ~127 мс; 0 = мгновенно (вес 1)
 	double diScale[3] = { 0.5, 0.25, 2.0 };      // множители режимов DI-xA / DI-xB / DI-xC
 	TraceCfg trace[opt::kMaxTracers];
 	WatchCfg watch[4];
@@ -579,6 +582,8 @@ static void LoadConfig()
 		else if (k == "exehooks") flag(g_cfg.exeHooks);
 		else if (k == "anchor") flag(g_cfg.anchor);
 		else if (k == "beeps") flag(g_cfg.beeps);
+		else if (k == "followfix") flag(g_cfg.followStart);
+		else if (k == "followtaums") { double d = 0; if (ParseDouble(v, &d) && d >= 0.0 && d <= 2000.0) g_cfg.followTauMs = d; else CfgErr(ln, k, "expected milliseconds in [0,2000] (0 = instant)"); }
 		else if (k == "rawscale") { double d = 0; if (ParseDouble(v, &d) && d > 0.0 && d < 100.0) g_cfg.rawScale = d; else CfgErr(ln, k, "expected a number in (0,100)"); }
 		else if (k == "offsens") { uintptr_t n = 0; if (ParseHex32(v, &n) && n < 0x10000) g_cfg.offSens = n; else CfgErr(ln, k, "expected hex offset < 0x10000"); }
 		else if (k == "offmousestate") { uintptr_t n = 0; if (ParseHex32(v, &n) && n < 0x10000) g_cfg.offMouseState = n; else CfgErr(ln, k, "expected hex offset < 0x10000"); }
@@ -941,63 +946,77 @@ struct TraceState
 	std::atomic<uint64_t> calls{ 0 };
 };
 static TraceState g_trace[opt::kMaxTracers];
-// v4.3: обход сглаживателя yaw/pitch контроллера LookUpdate. Данные сессии 223501: контроллер хранит свою пару углов
-// (this+0x40 pitch, this+0x44 yaw), которая каждый кадр догоняет угол камеры по кратчайшей дуге:
-//   x += 7.5*dt*wrap(target - x),  target_pitch = cam pitch,  target_yaw = atan2(m[0].x, m[0].z) - pi/2 (m = матрица блока камеры).
-// F4 каждый кадр (после фиксации поворота) принудительно ставит x := target, т.е. убирает отставание и перескоки.
+// v4.5: обход сглаживания камеры. Разбор FUN_0074D6F0 (внешний кадр камеры, ds3_range_0074D6C0): каждый кадр
+//   M = матрица(углы ctrl+0x44 yaw, +0x40 pitch, +0x48 roll);                 // 0074D834, углы - с прошлого кадра
+//   LookUpdate кладёт точную цель в блок камеры cam+0x20;                      // 0074D7D4
+//   R = FUN_0073EF10(M, (1-ctrl[0x140])*ctrl[0x70], (1-ctrl[0x13C])*ctrl[0x70]); // 0074DC60
+//   SetTransform(L, R) ... FUN_0074CF50(ctrl, L) пишет углы ctrl+0x40/0x44 обратно из L и считает положение камеры. // 0074DF1D
+// Значения в игре: ctrl[0x13C] = ctrl[0x140] = 0.75, ctrl[0x70] = 30*dt  =>  вес 0.25*30*dt = 7.5*dt, т.е. ровно
+// x(t+1) = x(t) + 7.5*dt*wrap(цель - x(t)) (на данных сессии 20261009_002857 невязка 3e-5 градуса).
+// F4 каждый кадр на входе LookUpdate (role=ctrl; раньше чтения этих полей в том же кадре) ставит f = 1 - w/ctrl[0x70],
+// где w = 1 (мгновенно) или 1-exp(-dt/tau) при FollowTauMs > 0. Так вес смешивания становится w, а не 0.1.
+// (v4.3/v4.4 писали сами углы ctrl+0x40/0x44 - они не состояние, а вывод FUN_0074CF50 в конце кадра, поэтому запись затиралась.)
 static std::atomic<bool> g_followFix{ false };
 static std::atomic<uint32_t> g_ctrlPtr{ 0 }, g_camBlk{ 0 };
 static std::atomic<uint64_t> g_followApplied{ 0 };
-// v4.4: диагностика F4. Видно: дошла ли запись, что стояло ДО неё (отстающее значение), прочиталось ли записанное сразу,
-// и осталось ли оно нетронутым к началу следующего LookUpdate (kept) или перезаписано (clobbered).
+// Диагностика: дошла ли запись, прочиталось ли записанное сразу, осталось ли нетронутым к следующему LookUpdate (kept)
+// или перезаписано игрой (clobbered).
 static std::atomic<uint64_t> g_fxCalls{ 0 }, g_fxSkipPtr{ 0 }, g_fxSkipRange{ 0 }, g_fxWriteFail{ 0 }, g_fxReadbackBad{ 0 };
 static std::atomic<uint64_t> g_fxKept{ 0 }, g_fxClobbered{ 0 };
-static std::atomic<uint32_t> g_fxLastPitchBits{ 0 }, g_fxLastYawBits{ 0 };
+static std::atomic<uint32_t> g_fxLast13c{ 0 }, g_fxLast140{ 0 };
 static std::atomic<bool> g_fxHaveLast{ false };
-static std::atomic<float> g_fxPreErrYaw{ 0.0f };    // |yaw до записи - цель|, последняя запись, рад
-static std::atomic<float> g_fxClobberYaw{ 0.0f };   // |yaw на входе LookUpdate - записанный|, последняя "затёртая", рад
+static std::atomic<bool> g_fxRestore{ false };
+static std::atomic<float> g_fxOrig13c{ 0.75f }, g_fxOrig140{ 0.75f };   // что игра держала в полях до нашей записи
+static std::atomic<float> g_fxLastW{ 0.0f }, g_fxLastDt30{ 0.0f }, g_fxLastF{ 0.0f };
 static std::atomic<uint64_t> g_ctrlCalls{ 0 };      // номер кадра (счётчик входов в LookUpdate)
 static uint32_t FBits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 static float WrapPi(float a) { while (a > 3.14159265f) a -= 6.28318531f; while (a < -3.14159265f) a += 6.28318531f; return a; }
-static void ApplyFollowFix()
+static void ApplyWeightFix(uint32_t c)
 {
 	g_fxCalls.fetch_add(1, std::memory_order_relaxed);
-	const uint32_t c = g_ctrlPtr.load(), b = g_camBlk.load();
-	if (!PlausiblePtr(c) || !PlausiblePtr(b)) { g_fxSkipPtr.fetch_add(1, std::memory_order_relaxed); return; }
-	float pitch = 0, m12 = 0, m14 = 0;
-	if (!ReadT((uintptr_t)b, &pitch) || !ReadT((uintptr_t)b + 0x10, &m12) || !ReadT((uintptr_t)b + 0x18, &m14)) { g_fxSkipPtr.fetch_add(1, std::memory_order_relaxed); return; }
-	if (!(std::fabs(pitch) < 3.2f) || !(std::fabs(m12) <= 1.001f) || !(std::fabs(m14) <= 1.001f)) { g_fxSkipRange.fetch_add(1, std::memory_order_relaxed); return; }
-	float yaw = std::atan2(m12, m14) - 1.57079632679f;
-	if (yaw < -3.14159265f) yaw += 6.28318531f;
-	float preYaw = 0;
-	if (ReadT((uintptr_t)c + 0x44, &preYaw)) g_fxPreErrYaw.store(std::fabs(WrapPi(yaw - preYaw)), std::memory_order_relaxed);
-	if (!WriteT((uintptr_t)c + 0x40, pitch) || !WriteT((uintptr_t)c + 0x44, yaw)) { g_fxWriteFail.fetch_add(1, std::memory_order_relaxed); return; }
-	float rbP = 0, rbY = 0;
-	if (!ReadT((uintptr_t)c + 0x40, &rbP) || !ReadT((uintptr_t)c + 0x44, &rbY) || FBits(rbP) != FBits(pitch) || FBits(rbY) != FBits(yaw)) g_fxReadbackBad.fetch_add(1, std::memory_order_relaxed);
-	g_fxLastPitchBits.store(FBits(pitch), std::memory_order_relaxed);
-	g_fxLastYawBits.store(FBits(yaw), std::memory_order_relaxed);
-	g_fxHaveLast.store(true, std::memory_order_relaxed);
-	g_followApplied.fetch_add(1, std::memory_order_relaxed);
-}
-// вызывается на входе LookUpdate (role=ctrl): осталось ли записанное F4 значение нетронутым с прошлого кадра
-static void FollowFixCheckKept(uint32_t ctrl)
-{
-	if (!g_fxHaveLast.load(std::memory_order_relaxed) || !PlausiblePtr(ctrl)) return;
-	float y = 0;
-	if (!ReadT((uintptr_t)ctrl + 0x44, &y)) return;
-	if (FBits(y) == g_fxLastYawBits.load(std::memory_order_relaxed)) g_fxKept.fetch_add(1, std::memory_order_relaxed);
+	if (!PlausiblePtr(c)) { g_fxSkipPtr.fetch_add(1, std::memory_order_relaxed); return; }
+	float dt30 = 0, f13 = 0, f14 = 0;
+	if (!ReadT((uintptr_t)c + 0x70, &dt30) || !ReadT((uintptr_t)c + 0x13C, &f13) || !ReadT((uintptr_t)c + 0x140, &f14)) { g_fxSkipPtr.fetch_add(1, std::memory_order_relaxed); return; }
+	if (!(dt30 > 0.05f && dt30 < 3.0f) || !std::isfinite(f13) || !std::isfinite(f14)) { g_fxSkipRange.fetch_add(1, std::memory_order_relaxed); return; }
+	if (g_fxHaveLast.load(std::memory_order_relaxed) && FBits(f13) == g_fxLast13c.load(std::memory_order_relaxed) && FBits(f14) == g_fxLast140.load(std::memory_order_relaxed))
+		g_fxKept.fetch_add(1, std::memory_order_relaxed);
 	else
 	{
-		g_fxClobbered.fetch_add(1, std::memory_order_relaxed);
-		g_fxClobberYaw.store(std::fabs(WrapPi(y - BitsToF(g_fxLastYawBits.load(std::memory_order_relaxed)))), std::memory_order_relaxed);
+		if (g_fxHaveLast.load(std::memory_order_relaxed)) g_fxClobbered.fetch_add(1, std::memory_order_relaxed);
+		if (f13 >= 0.0f && f13 < 1.0f) g_fxOrig13c.store(f13, std::memory_order_relaxed);   // настоящие значения игры лежат в [0,1)
+		if (f14 >= 0.0f && f14 < 1.0f) g_fxOrig140.store(f14, std::memory_order_relaxed);
 	}
+	double w = 1.0;
+	if (g_cfg.followTauMs > 0.0) w = 1.0 - std::exp(-((double)dt30 / 30.0) * 1000.0 / g_cfg.followTauMs);   // dt = dt30/30 с
+	if (w > 1.0) w = 1.0;
+	if (w < 0.0) w = 0.0;
+	const float f = (float)(1.0 - w / (double)dt30);
+	if (!WriteT((uintptr_t)c + 0x13C, f) || !WriteT((uintptr_t)c + 0x140, f)) { g_fxWriteFail.fetch_add(1, std::memory_order_relaxed); return; }
+	float r13 = 0, r14 = 0;
+	if (!ReadT((uintptr_t)c + 0x13C, &r13) || !ReadT((uintptr_t)c + 0x140, &r14) || FBits(r13) != FBits(f) || FBits(r14) != FBits(f)) g_fxReadbackBad.fetch_add(1, std::memory_order_relaxed);
+	g_fxLast13c.store(FBits(f), std::memory_order_relaxed);
+	g_fxLast140.store(FBits(f), std::memory_order_relaxed);
+	g_fxHaveLast.store(true, std::memory_order_relaxed);
+	g_fxLastW.store((float)w, std::memory_order_relaxed);
+	g_fxLastDt30.store(dt30, std::memory_order_relaxed);
+	g_fxLastF.store(f, std::memory_order_relaxed);
+	g_followApplied.fetch_add(1, std::memory_order_relaxed);
+}
+// F4 выключен: на следующем входе LookUpdate вернуть игровые коэффициенты
+static void RestoreWeights(uint32_t c)
+{
+	g_fxHaveLast.store(false, std::memory_order_relaxed);
+	if (!PlausiblePtr(c)) return;
+	WriteT((uintptr_t)c + 0x13C, g_fxOrig13c.load(std::memory_order_relaxed));
+	WriteT((uintptr_t)c + 0x140, g_fxOrig140.load(std::memory_order_relaxed));
 }
 static void LogFollowFixStats(const char* tag)
 {
-	Log("F4 stats (%s): on=%d calls=%llu applied=%llu skipPtr=%llu skipRange=%llu writeFail=%llu readbackBad=%llu | next-frame kept=%llu clobbered=%llu | last pre-write |yaw-target|=%.2f deg, last clobber |dyaw|=%.3f deg",
-		tag, (int)g_followFix.load(), (unsigned long long)g_fxCalls.load(), (unsigned long long)g_followApplied.load(), (unsigned long long)g_fxSkipPtr.load(),
+	Log("F4 stats (%s): on=%d tau_ms=%.1f calls=%llu applied=%llu skipPtr=%llu skipRange=%llu writeFail=%llu readbackBad=%llu | next-frame kept=%llu clobbered=%llu | last w=%.4f dt30=%.3f f=%.4f | game orig 13c=%.3f 140=%.3f",
+		tag, (int)g_followFix.load(), g_cfg.followTauMs, (unsigned long long)g_fxCalls.load(), (unsigned long long)g_followApplied.load(), (unsigned long long)g_fxSkipPtr.load(),
 		(unsigned long long)g_fxSkipRange.load(), (unsigned long long)g_fxWriteFail.load(), (unsigned long long)g_fxReadbackBad.load(),
-		(unsigned long long)g_fxKept.load(), (unsigned long long)g_fxClobbered.load(), (double)g_fxPreErrYaw.load() * 57.29578, (double)g_fxClobberYaw.load() * 57.29578);
+		(unsigned long long)g_fxKept.load(), (unsigned long long)g_fxClobbered.load(), (double)g_fxLastW.load(), (double)g_fxLastDt30.load(), (double)g_fxLastF.load(),
+		(double)g_fxOrig13c.load(), (double)g_fxOrig140.load());
 }
 
 // ----------------------------------------------------------------------------
@@ -1235,9 +1254,13 @@ static void OnTrace(int id, safetyhook::Context& ctx)
 	const uint32_t ecx = (uint32_t)ctx.ecx, edx = (uint32_t)ctx.edx, esp = (uint32_t)ctx.esp, eax = (uint32_t)ctx.eax;
 	const uint32_t bv = CtxReg(ctx, ts.base);
 	ts.lastBase.store(bv, std::memory_order_relaxed);
-	if (ts.role == 1) { g_ctrlPtr.store(bv, std::memory_order_relaxed); g_ctrlCalls.fetch_add(1, std::memory_order_relaxed); if (g_followFix.load(std::memory_order_relaxed)) FollowFixCheckKept(bv); }
-	else if (ts.role == 2) g_camBlk.store(bv, std::memory_order_relaxed);
-	else if (ts.role == 3 && g_followFix.load(std::memory_order_relaxed)) ApplyFollowFix();
+	if (ts.role == 1)
+	{
+		g_ctrlPtr.store(bv, std::memory_order_relaxed); g_ctrlCalls.fetch_add(1, std::memory_order_relaxed);
+		if (g_followFix.load(std::memory_order_relaxed)) ApplyWeightFix(bv);
+		else if (g_fxRestore.exchange(false, std::memory_order_relaxed)) RestoreWeights(bv);
+	}
+	else if (ts.role == 2) g_camBlk.store(bv, std::memory_order_relaxed);   // role=apply (3) в v4.5 не нужна: запись идёт на входе LookUpdate
 	uint32_t ra = 0, a[8] = {}, th[16] = {}, fv[16] = {};
 	ReadT(esp, &ra); // на входе функции это адрес возврата; для хука посреди функции - просто dword на вершине стека
 	if (ts.args > 0) ReadBytes(esp + 4, a, sizeof(uint32_t) * (size_t)ts.args);
@@ -1635,7 +1658,7 @@ static void StartCapture()
 		g_capMeta += "# roles:" + (rl.empty() ? std::string(" (none)") : rl) + "\n";
 		snprintf(b, sizeof(b), "# pointers ctrl=%08X camblock=%08X watch_on=%d\n", (unsigned)g_ctrlPtr.load(), (unsigned)g_camBlk.load(), (int)g_watchOn.load()); g_capMeta += b;
 	}
-	snprintf(b, sizeof(b), "# followfix=%d (F4 follower bypass; 1 = controller yaw/pitch forced to target each frame)\n", (int)g_followFix.load()); g_capMeta += b;
+	snprintf(b, sizeof(b), "# followfix=%d tau_ms=%.1f (F4 smoothing bypass: ctrl+0x13C/0x140 rewritten each LookUpdate so the blend weight is 1 (tau 0) or 1-exp(-dt/tau); value at capture start, F4 may be toggled mid-capture)\n", (int)g_followFix.load(), g_cfg.followTauMs); g_capMeta += b;
 	g_capMeta += "# conditions: " + cond + "\n";
 
 	g_capStart = NowMs();
@@ -2446,6 +2469,7 @@ static DWORD WINAPI WorkerThread(LPVOID)
 		(unsigned)g_timeDateStamp, (unsigned)g_sizeOfImage, (unsigned)g_imageBase, (unsigned)g_exeBase);
 	if (g_exeBase != g_imageBase) Log("WARNING: exe is loaded at %08X, not at its preferred base %08X; Rebase() assumes fixed addresses are shifted by the same delta", (unsigned)g_exeBase, (unsigned)g_imageBase);
 	LoadConfig();
+	if (g_cfg.followStart) { g_followFix.store(true); Log("cfg: FollowFix=1 -> smoothing bypass ON from start (F4 toggles), FollowTauMs=%.1f", g_cfg.followTauMs); }
 	ResolveTargets();
 
 	const double t0 = NowMs();
@@ -2477,9 +2501,11 @@ static DWORD WINAPI WorkerThread(LPVOID)
 		if (n4 && !k4)
 		{
 			const bool on = !g_followFix.load();
+			if (on) g_fxHaveLast.store(false);
+			else g_fxRestore.store(true);
 			g_followFix.store(on);
-			Log("=== F4: follower bypass %s (ctrl=%08X camblock=%08X applied so far=%llu) ===", on ? "ON" : "OFF", (unsigned)g_ctrlPtr.load(), (unsigned)g_camBlk.load(), (unsigned long long)g_followApplied.load());
-			if (on && (!g_ctrlPtr.load() || !g_camBlk.load())) Log("  F4: pointers not known yet (need tracers with role=ctrl and role=camblock, and role=apply) - nothing will be written");
+			Log("=== F4: smoothing bypass %s (ctrl=%08X tau_ms=%.1f applied so far=%llu) ===", on ? "ON" : "OFF", (unsigned)g_ctrlPtr.load(), g_cfg.followTauMs, (unsigned long long)g_followApplied.load());
+			if (on && !g_ctrlPtr.load()) Log("  F4: ctrl pointer not known yet (need a tracer with role=ctrl on LookUpdate 0073F310) - nothing will be written");
 			if (!on) LogFollowFixStats("F4 off");
 			Tone(on ? 2 : 1, on ? 1500 : 500);
 		}

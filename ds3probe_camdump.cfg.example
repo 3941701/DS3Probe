@@ -1,4 +1,4 @@
-# DS3Probe v4.4 - cfg для опыта "где рикошёт": дампы памяти объекта камеры + знакомые трассировщики.
+# DS3Probe v4.5 - cfg для опыта "где рикошёт": дампы памяти объекта камеры + знакомые трассировщики.
 # Положи рядом с deadspace3.exe под именем ds3probe.cfg (старый cfg сохрани под другим именем).
 # Байты взяты из Приложения A отчёта (база Ghidra 1.0.0.1).
 MD5 = 1802f17a2cc1c2797323632862c6fb1f
@@ -35,7 +35,7 @@ Trace4.bytes = 55 8B EC 8B 45 08 D9 EE 0F 28 00
 Trace4.name = SetTransform
 Trace4.args = 4
 Trace4.this = 4
-Trace4.role = apply
+Trace4.role = apply          # v4.5: роль apply больше не нужна (F4 пишет на входе LookUpdate, role=ctrl), строку можно оставить
 Trace4.dumpfrom = 8
 Trace4.dump = -20 300
 
@@ -67,3 +67,22 @@ Watch1 = ctrl 44 w
 Watch2 = ctrl 20 w
 Watch3 = ctrl 40 w
 Watch4 = camblock 10 rw
+
+# ---- v4.5: датчик "что уходит в SetTransform". Хук посреди FUN_0074D6F0 (0074DC6E: PUSH EDX; LEA ECX,[EBP-0F0]), EDX = указатель на
+# результат FUN_0073EF10 (3 строки по 16 байт = матрица, которую получает SetTransform). Без обхода это отстающая ориентация
+# (вес 7.5*dt), с обходом F4 - равна цели того же кадра. tools/analyze_follow.py печатает [V6] по этому трассировщику.
+Trace6 = 0074DC6E
+Trace6.bytes = 52 8D 8D 10 FF FF FF
+Trace6.name = BlendOut
+Trace6.args = 0
+Trace6.this = 0
+Trace6.base = edx
+Trace6.dump = 0 30
+
+# ---- v4.5: обход сглаживания камеры (F4). Нужен только трассировщик Trace2 с role = ctrl (LookUpdate).
+# FollowFix = 1       обход включён с запуска (F4 переключает на лету); по умолчанию выключен
+# FollowTauMs = 0     0 = камера точно в цели (вес смешивания 1). Любое число > 0 - постоянная времени в мс вместо
+#                     оригинальных ~127 мс (вес за кадр = 1-exp(-dt/tau)), например 30 - лёгкое сглаживание.
+#FollowFix = 0
+#FollowTauMs = 0
+

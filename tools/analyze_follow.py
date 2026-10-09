@@ -10,6 +10,11 @@ analyze_follow.py - разбор следящего слоя камеры по �
   [V3] привязка изменяющихся слов объекта-контроллера к углам: регрессия слова на {1, sin y cos p, cos y cos p, sin p}
        по следящим и по целевым углам; "орбита" = слово ложится на следящие углы заметно лучше, чем на целевые.
   [V4] (если есть пара) сравнение захватов "F4 вкл." и "F4 выкл.": дал ли F4 хоть какой-то эффект.
+  [V5] (v4.5) эффективный вес смешивания за кадр w = (x[t+1]-x[t]) / wrap(цель[t]-x[t]) и коэффициенты ctrl+0x13C/0x140:
+       оригинал w = (1-0.75)*ctrl[0x70] = 0.25*30*dt ~ 0.10; при F4 (v4.5) w ~ 1. Считается по кадрам, поэтому F4 можно
+       переключать прямо внутри захвата: печатается сколько кадров с обходом и сколько с оригинальным сглаживанием.
+  [V6] (v4.5, если в cfg есть трассировщик BlendOut = 0074DC6E, base=edx, dump 0 30) то, что реально уходит в SetTransform:
+       yaw/pitch результата FUN_0073EF10 против цели того же кадра. Без обхода ошибка ~ (1-w)*отставание, с обходом ~ 0.
 Цели берутся из дампа блока камеры (Trace4/Trace8, dump -20 300): pitch = слово блока +0x00,
 yaw = atan2(слово +0x10, слово +0x18) - pi/2 (проверено на данных сессий 223501 и 234905).
 
@@ -74,7 +79,8 @@ def load_capture(folder, cap):
             ids[m.split("name=")[1].split()[0]] = n
     ctrl_id = ids.get("LookUpdate", 2)
     cam_id = ids.get("SetTransform", 4)
-    return meta, by.get(ctrl_id, []), by.get(cam_id, [])
+    blend_id = ids.get("BlendOut")
+    return meta, by.get(ctrl_id, []), by.get(cam_id, []), (by.get(blend_id, []) if blend_id else [])
 
 
 def series(ctrl, cam, block_word=8):
@@ -146,7 +152,7 @@ def reg_rms(words, yaw, pitch):
 
 
 def analyze(folder, cap, out):
-    meta, ctrl, cam = load_capture(folder, cap)
+    meta, ctrl, cam, blend = load_capture(folder, cap)
     n0 = min(len(ctrl), len(cam))
     out.append("=== capture %03d: %d LookUpdate dumps, %d camera dumps, followfix=%s ===" % (cap, len(ctrl), len(cam), meta_flag(meta, "followfix")))
     for m in meta:
@@ -184,7 +190,47 @@ def analyze(folder, cap, out):
     for off, rf, rt, rng in hits:
         tag = "ORBIT (follows the lagging angles)" if rf < 0.2 * rt and rf < 0.05 * max(rng, 1e-9) + 1e-3 else ""
         out.append("     +0x%02X range %.4g  rms(follower)=%.4g  rms(target)=%.4g  %s" % (off, rng, rf, rt, tag))
-    return {"snaps": snaps, "p90": pct(err, 90), "med": pct(err, 50), "a_y": a_y}
+    # V5: эффективный вес смешивания по кадрам
+    dt30 = [hex_float("%x" % ctrl[i][1][28]) for i in range(n)]            # ctrl+0x70 = 30*dt
+    f13 = [hex_float("%x" % ctrl[i][1][79]) for i in range(n)]             # ctrl+0x13C
+    f14 = [hex_float("%x" % ctrl[i][1][80]) for i in range(n)]             # ctrl+0x140
+    weff, byp, orig, snap_n, big_n = [], 0, 0, 0, 0
+    for i in range(n - 1):
+        d = wrap(ty[i] - fy[i])
+        if abs(math.degrees(d)) < 0.5:
+            continue
+        big_n += 1
+        w = wrap(fy[i + 1] - fy[i]) / d
+        weff.append(w)
+        if w > 0.5:
+            byp += 1
+        elif w < 0.3:
+            orig += 1
+        if abs(math.degrees(wrap(fy[i + 1] - ty[i]))) < 0.01:
+            snap_n += 1
+    if weff:
+        out.append("[V5] blend weight per frame (frames with |target-x| > 0.5 deg: %d): median w=%.4f p10=%.4f p90=%.4f | w>0.5 (bypass) in %d frames, w<0.3 (original ~%.3f) in %d | x[t+1]==target[t] (<0.01 deg): %d"
+                   % (big_n, pct(weff, 50), pct(weff, 10), pct(weff, 90), byp, 0.25 * pct(dt30, 50), orig, snap_n))
+    out.append("     ctrl+0x13C: min %.3f median %.3f max %.3f; ctrl+0x140 median %.3f; ctrl+0x70 (30*dt) median %.3f  <- original 0.75/0.75; bypass writes 1-w/dt30 (negative)"
+               % (min(f13), pct(f13, 50), max(f13), pct(f14, 50), pct(dt30, 50)))
+    # V6: то, что уходит в SetTransform
+    bres = None
+    if len(blend) >= 50:
+        m = min(len(blend), n)
+        by_, bp_, tby, tbp = [], [], [], []
+        for i in range(m):
+            w = blend[i][1]
+            r0x, r0z, r2y = hex_float("%x" % w[0]), hex_float("%x" % w[2]), hex_float("%x" % w[9])
+            by_.append(wrap(math.atan2(r0x, r0z) - math.pi / 2))
+            bp_.append(math.asin(max(-1.0, min(1.0, -r2y))))
+        ey = [abs(math.degrees(wrap(by_[i] - ty[i]))) for i in range(m)]
+        ep = [abs(math.degrees(bp_[i] - tp[i])) for i in range(m)]
+        el = [abs(math.degrees(wrap(by_[i] - fy[i]))) for i in range(m)]
+        bres = {"p90": pct(ey, 90), "max": max(ey)}
+        out.append("[V6] SetTransform argument (BlendOut, %d frames) vs target of the same frame: |yaw err| median %.3f p90 %.3f max %.3f deg; |pitch err| p90 %.3f deg; moved from the lagging x by median %.3f p90 %.3f deg"
+                   % (m, pct(ey, 50), pct(ey, 90), max(ey), pct(ep, 90), pct(el, 50), pct(el, 90)))
+        out.append("     (original smoothing: error ~ 0.9*lag, p90 of the lag above; bypass: error ~ 0 => the displayed orientation is no longer delayed)")
+    return {"snaps": snaps, "p90": pct(err, 90), "med": pct(err, 50), "a_y": a_y, "bypass": byp, "big": big_n, "blend": bres}
 
 
 def main(argv=None):
@@ -205,7 +251,7 @@ def main(argv=None):
             out.append("capture %03d: no _dump.csv" % c)
     if a.pair and all(res.get(c) for c in a.pair):
         on, off = res[a.pair[0]], res[a.pair[1]]
-        verdict = "F4 HAD EFFECT" if on["snaps"] > 10 or on["p90"] < 0.5 * off["p90"] else "F4 had NO effect on the follower (lag/snaps unchanged)"
+        verdict = "F4 HAD EFFECT" if on["snaps"] > 10 or on["bypass"] > 10 or on["p90"] < 0.5 * off["p90"] else "F4 had NO effect on the follower (lag/snaps unchanged)"
         out.append("[V4] pair: F4 on  -> median %.2f p90 %.2f snaps %d | F4 off -> median %.2f p90 %.2f snaps %d  => %s"
                    % (on["med"], on["p90"], on["snaps"], off["med"], off["p90"], off["snaps"], verdict))
     print("\n".join(out))
