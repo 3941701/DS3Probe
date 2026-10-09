@@ -94,7 +94,7 @@
 #ifndef DS3PROBE_GIT_SHA
 #define DS3PROBE_GIT_SHA "unknown"
 #endif
-#define DS3PROBE_VERSION "v4.5"
+#define DS3PROBE_VERSION "v4.6"
 
 namespace opt
 {
@@ -349,6 +349,7 @@ struct Config
 	double rawScale = 1.0;                       // не используется с v4 (RAW убран), ключ принимается для совместимости
 	bool followStart = false;                    // v4.5: FollowFix = 1 - обход сглаживания включён с запуска (без F4)
 	double followTauMs = 0.0;                    // v4.5: FollowTauMs - постоянная времени вместо оригинальных ~127 мс; 0 = мгновенно (вес 1)
+	double stickClamp = 0.0;                     // v4.6: StickClamp - постоянное значение клэмпа FUN_0040D820 this[3] (исходное 2.0); 0 = не трогать. F11 по-прежнему перекрывает ступенью
 	double diScale[3] = { 0.5, 0.25, 2.0 };      // множители режимов DI-xA / DI-xB / DI-xC
 	TraceCfg trace[opt::kMaxTracers];
 	WatchCfg watch[4];
@@ -583,6 +584,7 @@ static void LoadConfig()
 		else if (k == "anchor") flag(g_cfg.anchor);
 		else if (k == "beeps") flag(g_cfg.beeps);
 		else if (k == "followfix") flag(g_cfg.followStart);
+		else if (k == "stickclamp") { double d = 0; if (ParseDouble(v, &d) && d >= 0.0 && d <= 1.0e9) g_cfg.stickClamp = d; else CfgErr(ln, k, "expected a number in [0,1e9] (0 = leave the game value 2.0; 1e9 = no clamp)"); }
 		else if (k == "followtaums") { double d = 0; if (ParseDouble(v, &d) && d >= 0.0 && d <= 2000.0) g_cfg.followTauMs = d; else CfgErr(ln, k, "expected milliseconds in [0,2000] (0 = instant)"); }
 		else if (k == "rawscale") { double d = 0; if (ParseDouble(v, &d) && d > 0.0 && d < 100.0) g_cfg.rawScale = d; else CfgErr(ln, k, "expected a number in (0,100)"); }
 		else if (k == "offsens") { uintptr_t n = 0; if (ParseHex32(v, &n) && n < 0x10000) g_cfg.offSens = n; else CfgErr(ln, k, "expected hex offset < 0x10000"); }
@@ -913,10 +915,14 @@ static uint32_t __fastcall StickSmooth_H(void* self, void* /*edx*/, float dt, fl
 	ReadT(reinterpret_cast<uintptr_t>(y), &yin);
 	const uintptr_t sp = reinterpret_cast<uintptr_t>(self);
 	const int clampLvl = g_openClamp.load(std::memory_order_relaxed);
-	if (clampLvl > 0 && clampLvl <= kClampSteps) // F11: this[3] := ступень лестницы (исходное значение запоминаем)
+	// v4.6: приоритет - ступень F11, затем постоянное значение StickClamp из cfg, иначе исходное
+	float wantClamp = 0.0f;
+	if (clampLvl > 0 && clampLvl <= kClampSteps) wantClamp = kClampLadder[clampLvl - 1];
+	else if (g_cfg.stickClamp > 0.0) wantClamp = (float)g_cfg.stickClamp;
+	if (wantClamp > 0.0f) // this[3] := выбранное значение (исходное запоминаем)
 	{
 		if (g_clampOrig.find(sp) == g_clampOrig.end()) { float o = 0; if (ReadT(sp + 0xC, &o)) g_clampOrig[sp] = o; }
-		WriteT(sp + 0xC, kClampLadder[clampLvl - 1]);
+		WriteT(sp + 0xC, wantClamp);
 	}
 	else if (!g_clampOrig.empty())
 	{
@@ -1658,6 +1664,7 @@ static void StartCapture()
 		g_capMeta += "# roles:" + (rl.empty() ? std::string(" (none)") : rl) + "\n";
 		snprintf(b, sizeof(b), "# pointers ctrl=%08X camblock=%08X watch_on=%d\n", (unsigned)g_ctrlPtr.load(), (unsigned)g_camBlk.load(), (int)g_watchOn.load()); g_capMeta += b;
 	}
+	snprintf(b, sizeof(b), "# stickclamp_cfg=%g (0 = game value; F11 ladder overrides: openclamp level above)\n", g_cfg.stickClamp); g_capMeta += b;
 	snprintf(b, sizeof(b), "# followfix=%d tau_ms=%.1f (F4 smoothing bypass: ctrl+0x13C/0x140 rewritten each LookUpdate so the blend weight is 1 (tau 0) or 1-exp(-dt/tau); value at capture start, F4 may be toggled mid-capture)\n", (int)g_followFix.load(), g_cfg.followTauMs); g_capMeta += b;
 	g_capMeta += "# conditions: " + cond + "\n";
 
@@ -2451,7 +2458,7 @@ static void ToggleOpenClamp()
 	const int lvl = (g_openClamp.load() + 1) % (kClampSteps + 1);
 	g_openClamp = lvl;
 	if (lvl == 0)
-		Log("=== F11: clamp ladder level 0/%d: FUN_0040D820 this[3] := original value ===", kClampSteps);
+		Log("=== F11: clamp ladder level 0/%d: FUN_0040D820 this[3] := %s ===", kClampSteps, g_cfg.stickClamp > 0.0 ? "the StickClamp value from the cfg" : "original value");
 	else
 		Log("=== F11: clamp ladder level %d/%d: FUN_0040D820 this[3] := %g on every call (the original is restored at level 0) ===", lvl, kClampSteps, (double)kClampLadder[lvl - 1]);
 	Tone(lvl == 0 ? 1 : 2, lvl == 0 ? 500 : 900 + 300 * lvl);
@@ -2469,6 +2476,7 @@ static DWORD WINAPI WorkerThread(LPVOID)
 		(unsigned)g_timeDateStamp, (unsigned)g_sizeOfImage, (unsigned)g_imageBase, (unsigned)g_exeBase);
 	if (g_exeBase != g_imageBase) Log("WARNING: exe is loaded at %08X, not at its preferred base %08X; Rebase() assumes fixed addresses are shifted by the same delta", (unsigned)g_exeBase, (unsigned)g_imageBase);
 	LoadConfig();
+	if (g_cfg.stickClamp > 0.0) Log("cfg: StickClamp=%g -> FUN_0040D820 this[3] is set to it on every call (the game value is 2.0)", g_cfg.stickClamp);
 	if (g_cfg.followStart) { g_followFix.store(true); Log("cfg: FollowFix=1 -> smoothing bypass ON from start (F4 toggles), FollowTauMs=%.1f", g_cfg.followTauMs); }
 	ResolveTargets();
 
