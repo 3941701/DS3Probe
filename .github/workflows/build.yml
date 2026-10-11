@@ -38,7 +38,7 @@ jobs:
           python tests/mock_ghidra_work91.py
 
       - name: Upload dinput8.dll
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: dinput8
           path: |
