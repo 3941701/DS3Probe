@@ -1,8 +1,10 @@
 // ============================================================================
-// DS3Probe v4 - прокси dinput8.dll для Dead Space 3. Ничего не чинит: собирает данные и (по F9/F11)
-// подменяет вход игры, чтобы локализовать причину "отрицательного ускорения" (потолка скорости камеры).
+// DS3Probe v4.9 - прокси dinput8.dll для Dead Space 3 1.0.0.1 (MD5 1802f17a...). Начиналась как проба (сбор данных,
+// подмена входа по F9/F11), сейчас это и исправление мыши: FollowFix/F4 (вес смешивания камеры = 1, без инерции и
+// "рикошёта"), StickClamp (сглаживатель стика без клэмпа), ZeroGYaw (усиление невесомости), AimLinear (прицел без
+// разгона усиления). Актуальное описание, все ключи cfg и хоткеи - README.md; ниже история v3/v4 (зачем что добавлялось).
 //
-// ЧТО НОВОГО В v4 (по результатам сессии 20261007_194254; подробности - claude/ds3_status.md):
+// ЧТО НОВОГО В v4 (по результатам сессии 20261007_194254):
 //  A. Факты прошлого опыта: (1) эталон Raw Input умер через ~1 с (DirectInput перерегистрировал мышь процесса);
 //     (2) камера крутилась при acc:=0 и look:=0, т.е. НЕ из аккумулятора Mouse_GetState и не из MouseState.look;
 //     (3) игра читает DI-мышь (DIMOUSESTATE2) каждый кадр, и её счёты == аккумулятор в ~98% кадров.
@@ -13,8 +15,8 @@
 //  C. Хуки конвейера "стик" (оба проверяются по байтам; соглашения вызова взяты из декомпиляции Ghidra):
 //        FUN_0040E680 (__thiscall, "мышь как виртуальный стик", круговой клэмп до длины 1.0)
 //        FUN_0040D820 (__thiscall, сглаживание по окну времени + клэмп +-this[3])
-//     Логируют входы/выходы/поля this в ds3probe_cap_NNN_stickv.csv / _sticks.csv. F11 = "открыть клэмп"
-//     (this[3] := 1e9 в FUN_0040D820 на каждом вызове): если потолок исчез - причина найдена.
+//     Логируют входы/выходы/поля this в ds3probe_cap_NNN_stickv.csv / _sticks.csv. F11 = ступени клэмпа
+//     (this[3] := 6/12/24/1e9 в FUN_0040D820 на каждом вызове; v4.6: постоянно - ключ StickClamp).
 //  D. Трассировщики Trace1..Trace8 из cfg: хук на ВХОДЕ любой функции (адрес + байты), лог ecx/edx/аргументов
 //     стека/полей this в ds3probe_cap_NNN_trace.csv. Нужны, чтобы проверять новые гипотезы из Ghidra без пересборки.
 //  E. user32!RegisterRawInputDevices: лог каждого вызова (кто, какие флаги/окно); раз в секунду (первые 12 с,
@@ -55,11 +57,10 @@
 //   F5 - (v4.2) метка "вижу рикошёт сейчас" в захвате
 //   F6 - маркер + таблица "кто вызывает user32"    F7/F8 - начало/конец захвата (CSV + итоги в лог)
 //   F9 - режим (см. B выше)                        F10   - условия опыта + список зарегистрированных raw-устройств
-//   F11 - "открыть клэмп" FUN_0040D820 вкл/выкл
+//   F11 - ступени клэмпа FUN_0040D820: 0 (StickClamp из cfg или игра) -> 6 -> 12 -> 24 -> 1e9 -> 0
 //
-// Сборка: GitHub Actions (см. CMakeLists.txt и .github/workflows/build.yml). MSVC, Win32, статический CRT.
-// ВНИМАНИЕ: автор не мог собрать этот файл (в его среде нет Windows-тулчейна); проверен только разбор
-// clang -fsyntax-only с самодельными заглушками заголовков. Если Actions выдаст ошибку - пришли текст.
+// Сборка: только GitHub Actions (см. CMakeLists.txt и .github/workflows/build.yml). MSVC, Win32, статический CRT.
+// Локального Windows-тулчейна у авторов нет: любое изменение проверяется сборкой в Actions.
 // ============================================================================
 #define _CRT_SECURE_NO_WARNINGS
 #define NOMINMAX
@@ -94,7 +95,7 @@
 #ifndef DS3PROBE_GIT_SHA
 #define DS3PROBE_GIT_SHA "unknown"
 #endif
-#define DS3PROBE_VERSION "v4.9"
+#define DS3PROBE_VERSION "v4.9.1"
 
 namespace opt
 {
@@ -2038,7 +2039,7 @@ static void StopCapture()
 	DumpDi(g_capIndex, di);
 	DumpStick(g_capIndex, rv, rs, rt);
 	DumpExtra(g_capIndex, rdump, rmarks);
-	Log("  next: python analyze_samples.py <session folder>\\ds3probe_cap_%03d_acc.csv", g_capIndex);
+	Log("  next: python tools\\analyze_follow.py <session folder> --cap %d   (camera, F4, aim)  |  python tools\\analyze_di.py <session folder>   (DI -> stick)", g_capIndex);
 	Tone(2, 1200);
 }
 
@@ -2437,12 +2438,15 @@ static void InstallExeHooks()
 		snprintf(nm, sizeof(nm), "Trace%d", i + 1);
 		if (!tc.bytes.set) { Log("  %s=%08X: no .bytes -> skipped", nm, (unsigned)tc.addr.v); continue; }
 		if (!FuncReady(nm, tc.addr.v, tc.bytes.v)) continue;
+		// Состояние заполняется ДО установки хука: OnTrace может сработать в потоке игры сразу после create_mid
+		// и читать name/fields/role, пока они ещё присваиваются (гонка с std::string/std::vector).
+		TraceState& ts = g_trace[i];
+		ts.name = tc.name.empty() ? std::string(nm) : tc.name; ts.addr = tc.addr.v; ts.args = tc.args; ts.thisDw = tc.thisDwords; ts.base = tc.base; ts.fields = tc.fields;
+		ts.dumpOff = tc.dumpOff; ts.dumpLen = tc.dumpLen; ts.dumpFrom = tc.dumpFrom; ts.role = tc.role;
 		g_traceHooks[i] = safetyhook::create_mid(reinterpret_cast<void*>(Rebase(tc.addr.v)), kTraceFns[i]);
 		if (g_traceHooks[i])
 		{
-			TraceState& ts = g_trace[i];
-			ts.on = true; ts.name = tc.name.empty() ? std::string(nm) : tc.name; ts.addr = tc.addr.v; ts.args = tc.args; ts.thisDw = tc.thisDwords; ts.base = tc.base; ts.fields = tc.fields;
-			ts.dumpOff = tc.dumpOff; ts.dumpLen = tc.dumpLen; ts.dumpFrom = tc.dumpFrom; ts.role = tc.role;
+			ts.on = true;
 			++g_traceOn;
 		}
 		Log("  %s (%s) hook: %s", nm, tc.name.empty() ? "-" : tc.name.c_str(), g_traceHooks[i] ? "ok" : "FAILED");

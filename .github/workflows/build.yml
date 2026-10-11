@@ -20,11 +20,22 @@ jobs:
         run: cmake --build build --config Release
 
       - name: Python self-tests (analyzers)
+        shell: bash   # pwsh would only fail on the LAST command; bash -e stops at the first failing test
         env:
           PYTHONUTF8: "1"
         run: |
           python tests/test_analyze_di.py
           python tests/test_analyze_follow.py
+          python tests/test_analyze.py
+
+      - name: Python self-tests (Ghidra scripts on a mock API)
+        shell: bash   # pwsh would only fail on the LAST command; bash -e stops at the first failing test
+        env:
+          PYTHONUTF8: "1"
+        run: |
+          python tests/mock_ghidra_di.py
+          python tests/mock_ghidra_cam.py
+          python tests/mock_ghidra_work91.py
 
       - name: Upload dinput8.dll
         uses: actions/upload-artifact@v4
@@ -34,6 +45,7 @@ jobs:
             build/Release/dinput8.dll
             README.md
             ds3probe.cfg.example
+            ds3probe_play.cfg.example
             ds3probe_camdump.cfg.example
             tools/analyze_di.py
             tools/analyze_follow.py
