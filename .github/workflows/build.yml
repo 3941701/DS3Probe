@@ -14,6 +14,9 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Configure (Win32, Release)
+        env:
+          # SHA головы ветки PR (у pull_request GITHUB_SHA - тестовый merge-коммит); для push - сам коммит
+          DS3PROBE_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: cmake -S . -B build -A Win32
 
       - name: Build
@@ -26,6 +29,7 @@ jobs:
         run: |
           python tests/test_analyze_di.py
           python tests/test_analyze_follow.py
+          python tests/test_analyze_gain.py
           python tests/test_analyze.py
 
       - name: Python self-tests (Ghidra scripts on a mock API)
@@ -49,3 +53,4 @@ jobs:
             ds3probe_camdump.cfg.example
             tools/analyze_di.py
             tools/analyze_follow.py
+            tools/analyze_gain.py

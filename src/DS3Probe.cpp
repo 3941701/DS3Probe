@@ -95,10 +95,11 @@
 #ifndef DS3PROBE_GIT_SHA
 #define DS3PROBE_GIT_SHA "unknown"
 #endif
-#define DS3PROBE_VERSION "v4.9.1"
+#define DS3PROBE_VERSION "v4.10"
 
 namespace opt
 {
+	constexpr int kVkLookPitch = VK_F2; // v4.10: ступени LookPitch (вертикаль обычной камеры) на лету
 	constexpr int kVkWatch  = VK_F3;   // v4.4: вкл/выкл ловец писателей (аппаратные точки останова)
 	constexpr int kVkFollow = VK_F4;   // v4.5: вкл/выкл обход сглаживания камеры (вес смешивания FUN_0073EF10 = 1)
 	constexpr int kVkBounce = VK_F5;   // v4.2: "вижу рикошёт прямо сейчас" - метка времени в захвате
@@ -351,6 +352,8 @@ struct Config
 	bool followStart = false;                    // v4.5: FollowFix = 1 - обход сглаживания включён с запуска (без F4)
 	double followTauMs = 0.0;                    // v4.5: FollowTauMs - постоянная времени вместо оригинальных ~127 мс; 0 = мгновенно (вес 1)
 	bool aimLinear = false;                      // v4.8: AimLinear = 1 - в прицеле поворот строго линейный (без "разгона" усиления до 2x); нужен трассировщик ApplyRotDelta с role = aimlin; работает, пока включён F4
+	double lookPitch = 1.0;                      // v4.10: LookPitch - множитель вертикали обычной камеры (земля и магнитная поверхность, вызов сглаживателя из 0073F407); 1 = не трогать
+	bool rawInputRef = false;                    // v4.10: RawInputRef = 1 - поток Raw Input (эталон для опытов v3/v4); по умолчанию выключен, мышь регистрирует только игра
 	double zeroGYaw = 1.0, zeroGPitch = 1.0;     // v4.7: ZeroGYaw / ZeroGPitch - множители выхода сглаживателя стика в невесомости (вызов из 0054F806); 1 = не трогать
 	double stickClamp = 0.0;                     // v4.6: StickClamp - постоянное значение клэмпа FUN_0040D820 this[3] (исходное 2.0); 0 = не трогать. F11 по-прежнему перекрывает ступенью
 	double diScale[3] = { 0.5, 0.25, 2.0 };      // множители режимов DI-xA / DI-xB / DI-xC
@@ -590,6 +593,8 @@ static void LoadConfig()
 		else if (k == "aimlinear") flag(g_cfg.aimLinear);
 		else if (k == "stickclamp") { double d = 0; if (ParseDouble(v, &d) && d >= 0.0 && d <= 1.0e9) g_cfg.stickClamp = d; else CfgErr(ln, k, "expected a number in [0,1e9] (0 = leave the game value 2.0; 1e9 = no clamp)"); }
 		else if (k == "zerogyaw") { double d = 0; if (ParseDouble(v, &d) && d >= 0.1 && d <= 10.0) g_cfg.zeroGYaw = d; else CfgErr(ln, k, "expected a multiplier in [0.1,10] (1 = leave the game gain; 2.15 matches the ground yaw)"); }
+		else if (k == "lookpitch") { double d = 0; if (ParseDouble(v, &d) && d >= 0.1 && d <= 10.0) g_cfg.lookPitch = d; else CfgErr(ln, k, "expected a multiplier in [0.1,10] (1 = leave the game gain; 2.15 = vertical as fast as horizontal on the ground at the menu sensitivity 50)"); }
+		else if (k == "rawinputref") flag(g_cfg.rawInputRef);
 		else if (k == "zerogpitch") { double d = 0; if (ParseDouble(v, &d) && d >= 0.1 && d <= 10.0) g_cfg.zeroGPitch = d; else CfgErr(ln, k, "expected a multiplier in [0.1,10] (1 = leave the game gain)"); }
 		else if (k == "followtaums") { double d = 0; if (ParseDouble(v, &d) && d >= 0.0 && d <= 2000.0) g_cfg.followTauMs = d; else CfgErr(ln, k, "expected milliseconds in [0,2000] (0 = instant)"); }
 		else if (k == "rawscale") { double d = 0; if (ParseDouble(v, &d) && d > 0.0 && d < 100.0) g_cfg.rawScale = d; else CfgErr(ln, k, "expected a number in (0,100)"); }
@@ -919,6 +924,12 @@ static std::atomic<uint32_t> g_aimXBits{ 0 }, g_aimYBits{ 0 }, g_aimDtBits{ 0 };
 static std::atomic<double> g_aimStamp{ -1.0e9 };                                  // NowMs() этого вызова
 static const uintptr_t kZeroGSmoothRet = 0x0054F806;   // Ghidra-адрес возврата из FUN_0040D820 в коде свободного полёта (захват 20261009_204726: 1297 из 1297 вызовов)
 static std::atomic<uint64_t> g_zeroGScaled{ 0 };
+static const uintptr_t kLookSmoothRet = 0x0073F407;    // v4.10: возврат из FUN_0040D820 в LookUpdate (обычная камера: земля и магнитная поверхность)
+static std::atomic<uint64_t> g_lookPitchScaled{ 0 }, g_padSkips{ 0 };
+static std::atomic<float> g_lookPitch{ 1.0f };   // v4.10: текущий множитель (из cfg LookPitch, F2 перебирает ступени)
+static const float kLookPitchSteps[] = { 1.0f, 1.25f, 1.5f, 1.75f, 2.0f, 2.15f };
+static std::vector<std::pair<double, float>> g_lookPitchMarks;   // смены F2 во время захвата: (мс от начала, новое значение), под g_stickMu
+static std::atomic<bool> g_aimFromMouse{ false };       // v4.10: последний выход сглаживателя в прицеле получен с мыши (байт this+0x30 = 1)
 static uint32_t __fastcall StickSmooth_H(void* self, void* /*edx*/, float dt, float* x, float* y)
 {
 	void* const caller = _ReturnAddress(); // v4.1: настоящий вызывающий (в v4 колонка ret_hex была возвращаемым значением, а не адресом)
@@ -942,9 +953,28 @@ static uint32_t __fastcall StickSmooth_H(void* self, void* /*edx*/, float dt, fl
 		if (it != g_clampOrig.end()) { WriteT(sp + 0xC, it->second); g_clampOrig.erase(it); }
 	}
 	const uint32_t r = hkStickSmooth.unsafe_thiscall<uint32_t>(self, dt, x, y);
+	// v4.10: байт this+0x30 после вызова = 1, если пара пришла с клавиатуры+мыши и прошла сглаживание; 0 - пара геймпада прошла как есть
+	// (декомпиляция FUN_0040D820; на всех захватах с мышью 1 в 100 % вызовов). Исправления ниже касаются только мыши.
+	uint8_t act = 0;
+	const bool mouse = ReadT(sp + 0x30, &act) && act == 1;
+	if (!mouse) g_padSkips.fetch_add(1, std::memory_order_relaxed);
+	// v4.10: вертикаль обычной камеры. На земле усиление yaw 3.940, pitch 1.833 рад/с на единицу выхода (множители чувствительности
+	// игры: горизонталь x2.149, вертикаль x1.0; поле скорости ctrl+0x150 = ctrl+0x158 = 3.5 град), на магнитной поверхности pitch 1.309
+	// (ctrl+0x158 = 2.5 град). Масштабируем только y на выходе (то, что получает LookUpdate), состояние сглаживателя не трогаем.
+	const float lp = g_lookPitch.load(std::memory_order_relaxed);
+	if (mouse && lp != 1.0f && reinterpret_cast<uintptr_t>(caller) == Rebase(kLookSmoothRet))
+	{
+		float oy = 0;
+		if (ReadT(reinterpret_cast<uintptr_t>(y), &oy) && FiniteF(oy, 1.0e9f))
+		{
+			WriteT(reinterpret_cast<uintptr_t>(y), oy * lp);
+			if (g_lookPitchScaled.fetch_add(1, std::memory_order_relaxed) == 0)
+				Log("LookPitch: vertical of the normal camera multiplied by %.3f (caller %08X; first call: y %.4f -> %.4f)", (double)lp, (unsigned)kLookSmoothRet, (double)oy, (double)(oy * lp));
+		}
+	}
 	// v4.7: невесомость (свободный полёт) - отдельный вызывающий; усиление там 1.8326 рад/с на единицу стика по обеим осям
 	// против 3.94 (yaw) на земле. Масштабируем только выход (то, что получает ApplyRotDelta), состояние сглаживателя не трогаем.
-	if ((g_cfg.zeroGYaw != 1.0 || g_cfg.zeroGPitch != 1.0) && reinterpret_cast<uintptr_t>(caller) == Rebase(kZeroGSmoothRet))
+	if (mouse && (g_cfg.zeroGYaw != 1.0 || g_cfg.zeroGPitch != 1.0) && reinterpret_cast<uintptr_t>(caller) == Rebase(kZeroGSmoothRet))
 	{
 		float ox = 0, oy = 0;
 		if (ReadT(reinterpret_cast<uintptr_t>(x), &ox) && ReadT(reinterpret_cast<uintptr_t>(y), &oy) && FiniteF(ox, 1.0e9f) && FiniteF(oy, 1.0e9f))
@@ -958,6 +988,7 @@ static uint32_t __fastcall StickSmooth_H(void* self, void* /*edx*/, float dt, fl
 	}
 	if (reinterpret_cast<uintptr_t>(caller) == Rebase(kAimSmoothRet))   // v4.8: запомнить выход для AimLinearize (тот же кадр, ApplyRotDelta прицела идёт после)
 	{
+		g_aimFromMouse.store(mouse, std::memory_order_relaxed);
 		float ox = 0, oy = 0;
 		if (ReadT(reinterpret_cast<uintptr_t>(x), &ox) && ReadT(reinterpret_cast<uintptr_t>(y), &oy))
 		{
@@ -1019,7 +1050,9 @@ static void ApplyWeightFix(uint32_t c)
 	if (!PlausiblePtr(c)) { g_fxSkipPtr.fetch_add(1, std::memory_order_relaxed); return; }
 	float dt30 = 0, f13 = 0, f14 = 0;
 	if (!ReadT((uintptr_t)c + 0x70, &dt30) || !ReadT((uintptr_t)c + 0x13C, &f13) || !ReadT((uintptr_t)c + 0x140, &f14)) { g_fxSkipPtr.fetch_add(1, std::memory_order_relaxed); return; }
-	if (!(dt30 > 0.05f && dt30 < 3.0f) || !std::isfinite(f13) || !std::isfinite(f14)) { g_fxSkipRange.fetch_add(1, std::memory_order_relaxed); return; }
+	// v4.10: пропускаем только мусор. Раньше кадры с dt < 1.7 мс или > 100 мс (подвисания) пропускались, в полях оставалось f прошлого кадра,
+	// и вес смешивания становился dt_сейчас/dt_прошлый (больше 1 на подвисании). f = 1 - w/ctrl[0x70] даёт ровно w для любого ctrl[0x70] > 0.
+	if (!(dt30 > 1.0e-4f && dt30 < 100.0f) || !std::isfinite(f13) || !std::isfinite(f14)) { g_fxSkipRange.fetch_add(1, std::memory_order_relaxed); return; }
 	if (g_fxHaveLast.load(std::memory_order_relaxed) && FBits(f13) == g_fxLast13c.load(std::memory_order_relaxed) && FBits(f14) == g_fxLast140.load(std::memory_order_relaxed))
 		g_fxKept.fetch_add(1, std::memory_order_relaxed);
 	else
@@ -1055,6 +1088,7 @@ static std::atomic<uint64_t> g_alCalls{ 0 }, g_alYaw{ 0 }, g_alPitch{ 0 }, g_alS
 static std::atomic<float> g_alMaxMY{ 1.0f }, g_alMaxMP{ 1.0f };   // максимум отношения к базе по ВСЕМ кадрам, в том числе не прошедшим проверку
 static std::atomic<uint32_t> g_alHistY[6], g_alHistP[6];            // распределение M (<=1.05, <=1.5, <=2.0, <=3.0, <=4.05, больше) по всем кадрам с вычисленным M
 static std::atomic<int> g_alSkipLogged{ 0 };
+static std::atomic<uint64_t> g_alPad{ 0 }, g_alSigned{ 0 };   // v4.10: кадры с геймпада; кадры с отрицательным отношением (инверсия оси)
 static const double kAimBaseYaw = 1.7453292519943295, kAimBasePitch = 1.3962634015954636;   // 100 и 80 градусов/с на единицу выхода сглаживателя
 static const double kAimYawLo = 0.97, kAimYawHi = 2.5, kAimPitchLo = 0.97, kAimPitchHi = 4.5;
 static inline int AimHistBucket(double m) { return m <= 1.05 ? 0 : (m <= 1.5 ? 1 : (m <= 2.0 ? 2 : (m <= 3.0 ? 3 : (m <= 4.05 ? 4 : 5)))); }
@@ -1064,19 +1098,23 @@ static void AimLinearize(uint32_t esp, uint32_t ra)
 	if (ra != (uint32_t)Rebase(kAimRotRet1) && ra != (uint32_t)Rebase(kAimRotRet2)) return;
 	g_alCalls.fetch_add(1, std::memory_order_relaxed);
 	if (NowMs() - g_aimStamp.load(std::memory_order_acquire) > 60.0) { g_alStale.fetch_add(1, std::memory_order_relaxed); return; }
+	if (!g_aimFromMouse.load(std::memory_order_relaxed)) { g_alPad.fetch_add(1, std::memory_order_relaxed); return; }   // v4.10: стик геймпада - разгон игры не трогаем
 	const uint32_t bx = g_aimXBits.load(std::memory_order_relaxed), by = g_aimYBits.load(std::memory_order_relaxed), bd = g_aimDtBits.load(std::memory_order_relaxed);
 	float x, y, dt; memcpy(&x, &bx, 4); memcpy(&y, &by, 4); memcpy(&dt, &bd, 4);
 	float a0 = 0, a1 = 0;
 	if (!ReadT((uintptr_t)esp + 4, &a0) || !ReadT((uintptr_t)esp + 8, &a1) || !FiniteF(x, 1.0e6f) || !FiniteF(y, 1.0e6f) || !(dt > 0.0f && dt < 1.0f)) { g_alModel.fetch_add(1, std::memory_order_relaxed); return; }
 	const double bYaw = -kAimBaseYaw * (double)x * (double)dt, bPitch = kAimBasePitch * (double)y * (double)dt;
-	double my = 1.0, mp = 1.0; bool fixY = false, fixP = false, skip = false;
+	double my = 1.0, mp = 1.0, sY = 1.0, sP = 1.0; bool fixY = false, fixP = false, skip = false;
 	// |a| < 1e-6 - шум округления (во втором вызове при покое бывает ~1e-8), считаем нулём и не трогаем. Оси проверяются независимо.
 	if (std::fabs(a1) >= 1.0e-6f)
 	{
 		if (std::fabs(x) < 1.0e-6f) { skip = true; g_alSkipYaw.fetch_add(1, std::memory_order_relaxed); }
 		else
 		{
+			// v4.10: сравниваем по модулю. С инверсией оси в игре знак a1 противоположен базе, отношение отрицательное; раньше такая ось
+			// уходила в skipModel и разгон оставался. Подставляем базу со знаком игры, то есть инверсия сохраняется.
 			my = (double)a1 / bYaw;
+			if (my < 0.0) { g_alSigned.fetch_add(1, std::memory_order_relaxed); sY = -1.0; my = -my; }
 			MaxF(g_alMaxMY, (float)my); g_alHistY[AimHistBucket(my)].fetch_add(1, std::memory_order_relaxed);
 			if (my >= kAimYawLo && my <= kAimYawHi) fixY = true; else { skip = true; g_alSkipYaw.fetch_add(1, std::memory_order_relaxed); }
 		}
@@ -1090,6 +1128,7 @@ static void AimLinearize(uint32_t esp, uint32_t ra)
 		else
 		{
 			mp = (double)a0 / bPitch;
+			if (mp < 0.0) { g_alSigned.fetch_add(1, std::memory_order_relaxed); sP = -1.0; mp = -mp; }
 			MaxF(g_alMaxMP, (float)mp); g_alHistP[AimHistBucket(mp)].fetch_add(1, std::memory_order_relaxed);
 			if (mp >= kAimPitchLo && mp <= kAimPitchHi) fixP = true; else skipP = true;
 		}
@@ -1101,8 +1140,8 @@ static void AimLinearize(uint32_t esp, uint32_t ra)
 		}
 	}
 	if (skip) g_alModel.fetch_add(1, std::memory_order_relaxed);
-	if (fixY) { if (WriteT((uintptr_t)esp + 8, (float)bYaw)) g_alYaw.fetch_add(1, std::memory_order_relaxed); else g_alWriteFail.fetch_add(1, std::memory_order_relaxed); }
-	if (fixP) { if (WriteT((uintptr_t)esp + 4, (float)bPitch)) g_alPitch.fetch_add(1, std::memory_order_relaxed); else g_alWriteFail.fetch_add(1, std::memory_order_relaxed); }
+	if (fixY) { if (WriteT((uintptr_t)esp + 8, (float)(sY * bYaw))) g_alYaw.fetch_add(1, std::memory_order_relaxed); else g_alWriteFail.fetch_add(1, std::memory_order_relaxed); }
+	if (fixP) { if (WriteT((uintptr_t)esp + 4, (float)(sP * bPitch))) g_alPitch.fetch_add(1, std::memory_order_relaxed); else g_alWriteFail.fetch_add(1, std::memory_order_relaxed); }
 }
 // F4 выключен: на следующем входе LookUpdate вернуть игровые коэффициенты
 static void RestoreWeights(uint32_t c)
@@ -1121,9 +1160,9 @@ static void LogFollowFixStats(const char* tag)
 		(double)g_fxOrig13c.load(), (double)g_fxOrig140.load());
 	if (g_cfg.aimLinear)
 	{
-		Log("AimLinear stats (%s): calls=%llu fixedYaw=%llu fixedPitch=%llu skipStale=%llu skipModel=%llu (yaw %llu, pitch %llu) writeFail=%llu | game's max gain multiplier seen (all frames): yaw x%.3f pitch x%.3f",
-			tag, (unsigned long long)g_alCalls.load(), (unsigned long long)g_alYaw.load(), (unsigned long long)g_alPitch.load(), (unsigned long long)g_alStale.load(),
-			(unsigned long long)g_alModel.load(), (unsigned long long)g_alSkipYaw.load(), (unsigned long long)g_alSkipPitch.load(), (unsigned long long)g_alWriteFail.load(), (double)g_alMaxMY.load(), (double)g_alMaxMP.load());
+		Log("AimLinear stats (%s): calls=%llu fixedYaw=%llu fixedPitch=%llu skipStale=%llu skipPad=%llu skipModel=%llu (yaw %llu, pitch %llu) inverted=%llu writeFail=%llu | game's max gain multiplier seen (all frames): yaw x%.3f pitch x%.3f",
+			tag, (unsigned long long)g_alCalls.load(), (unsigned long long)g_alYaw.load(), (unsigned long long)g_alPitch.load(), (unsigned long long)g_alStale.load(), (unsigned long long)g_alPad.load(),
+			(unsigned long long)g_alModel.load(), (unsigned long long)g_alSkipYaw.load(), (unsigned long long)g_alSkipPitch.load(), (unsigned long long)g_alSigned.load(), (unsigned long long)g_alWriteFail.load(), (double)g_alMaxMY.load(), (double)g_alMaxMP.load());
 		Log("AimLinear gain histogram (<=1.05 / <=1.5 / <=2 / <=3 / <=4.05 / more): yaw %u %u %u %u %u %u | pitch %u %u %u %u %u %u",
 			g_alHistY[0].load(), g_alHistY[1].load(), g_alHistY[2].load(), g_alHistY[3].load(), g_alHistY[4].load(), g_alHistY[5].load(),
 			g_alHistP[0].load(), g_alHistP[1].load(), g_alHistP[2].load(), g_alHistP[3].load(), g_alHistP[4].load(), g_alHistP[5].load());
@@ -1730,7 +1769,7 @@ static void StartCapture()
 	}
 	{
 		std::lock_guard<std::mutex> lk(g_stickMu);
-		g_recV.clear(); g_recS.clear(); g_recT.clear(); g_recD.clear(); g_marks.clear();
+		g_recV.clear(); g_recS.clear(); g_recT.clear(); g_recD.clear(); g_marks.clear(); g_lookPitchMarks.clear();
 	}
 	g_capRawStart = g_rawTotal.load();
 	for (TraceState& t : g_trace) t.calls.store(0);
@@ -1771,6 +1810,7 @@ static void StartCapture()
 		snprintf(b, sizeof(b), "# pointers ctrl=%08X camblock=%08X watch_on=%d\n", (unsigned)g_ctrlPtr.load(), (unsigned)g_camBlk.load(), (int)g_watchOn.load()); g_capMeta += b;
 	}
 	snprintf(b, sizeof(b), "# zerog_scale yaw=%g pitch=%g scaled_calls=%llu (smoother output multiplied for caller %08X; sticks.csv x_out/y_out are AFTER scaling)\n", g_cfg.zeroGYaw, g_cfg.zeroGPitch, (unsigned long long)g_zeroGScaled.load(), (unsigned)kZeroGSmoothRet); g_capMeta += b;
+	snprintf(b, sizeof(b), "# lookpitch=%g scaled_calls=%llu (smoother output y multiplied for caller %08X; sticks.csv y_out of that caller is AFTER scaling; value at capture start, F2 changes are in lookpitch_changes below) | gamepad_calls=%llu (smoother byte +0x30 = 0: LookPitch/ZeroG/AimLinear leave them alone)\n", (double)g_lookPitch.load(), (unsigned long long)g_lookPitchScaled.load(), (unsigned)kLookSmoothRet, (unsigned long long)g_padSkips.load()); g_capMeta += b;
 	snprintf(b, sizeof(b), "# aimlinear cfg=%d active=%d (trace args a0/a1 of ApplyRotDelta at 00552176/00552222 are the ORIGINAL game values; the camera gets M=1 instead) fixedYaw=%llu fixedPitch=%llu\n", (int)g_cfg.aimLinear, (int)(g_cfg.aimLinear && g_followFix.load()), (unsigned long long)g_alYaw.load(), (unsigned long long)g_alPitch.load()); g_capMeta += b;
 	snprintf(b, sizeof(b), "# stickclamp_cfg=%g (0 = game value; F11 ladder overrides: openclamp level above)\n", g_cfg.stickClamp); g_capMeta += b;
 	snprintf(b, sizeof(b), "# followfix=%d tau_ms=%.1f (F4 smoothing bypass: ctrl+0x13C/0x140 rewritten each LookUpdate so the blend weight is 1 (tau 0) or 1-exp(-dt/tau); value at capture start, F4 may be toggled mid-capture)\n", (int)g_followFix.load(), g_cfg.followTauMs); g_capMeta += b;
@@ -2008,9 +2048,10 @@ static void StopCapture()
 	std::vector<TraceRec> rt;
 	std::vector<DumpRec> rdump;
 	std::vector<double> rmarks;
+	std::vector<std::pair<double, float>> rlp;
 	{
 		std::lock_guard<std::mutex> lk(g_stickMu);
-		rv.swap(g_recV); rs.swap(g_recS); rt.swap(g_recT); rdump.swap(g_recD); rmarks.swap(g_marks);
+		rv.swap(g_recV); rs.swap(g_recS); rt.swap(g_recT); rdump.swap(g_recD); rmarks.swap(g_marks); rlp.swap(g_lookPitchMarks);
 	}
 	// жив ли эталон Raw Input: события были в окне захвата и последнее не старше 2 с
 	{
@@ -2018,7 +2059,7 @@ static void StopCapture()
 		const double last = g_lastRawMs.load();
 		const bool alive = ev > 0 && last >= 0 && (NowMs() - last) < 2000.0;
 		char b[200];
-		snprintf(b, sizeof(b), "# raw_reference=%s raw_events_in_capture=%llu last_raw_event_age_s=%.1f\n", alive ? "alive" : "DEAD", (unsigned long long)ev,
+		snprintf(b, sizeof(b), "# raw_reference=%s raw_events_in_capture=%llu last_raw_event_age_s=%.1f\n", !g_cfg.rawInputRef ? "off" : (alive ? "alive" : "DEAD"), (unsigned long long)ev,
 			last >= 0 ? (NowMs() - last) / 1000.0 : -1.0);
 		g_capMetaTail = b;
 		{
@@ -2027,6 +2068,12 @@ static void StopCapture()
 				(int)g_followFix.load(), (unsigned long long)g_fxCalls.load(), (unsigned long long)g_followApplied.load(), (unsigned long long)g_fxSkipPtr.load(), (unsigned long long)g_fxSkipRange.load(),
 				(unsigned long long)g_fxWriteFail.load(), (unsigned long long)g_fxReadbackBad.load(), (unsigned long long)g_fxKept.load(), (unsigned long long)g_fxClobbered.load());
 			g_capMetaTail += f4;
+		}
+		{
+			std::string lpc = "# lookpitch_changes (F2; ms from capture start=new value):";
+			if (rlp.empty()) lpc += " none";
+			for (const auto& m : rlp) { char e[48]; snprintf(e, sizeof(e), " %.1f=%g", m.first, (double)m.second); lpc += e; }
+			g_capMetaTail += lpc + "\n";
 		}
 		LogFollowFixStats("capture stop");
 		Log("  raw reference: %s", b + 2);
@@ -2538,6 +2585,28 @@ static void DumpCallers()
 
 static bool KeyDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
+// v4.10: F2 - следующая ступень LookPitch (больше текущей; после 2.15 снова 1). Звук: 1 низкий на 1.0, иначе высокие по номеру ступени.
+static void CycleLookPitch()
+{
+	const int n = (int)(sizeof(kLookPitchSteps) / sizeof(kLookPitchSteps[0]));
+	const float cur = g_lookPitch.load();
+	int idx = 0;
+	for (int i = 0; i < n; ++i)
+		if (kLookPitchSteps[i] > cur + 1.0e-4f) { idx = i; break; }
+	const float next = kLookPitchSteps[idx];
+	g_lookPitch.store(next);
+	double tm = -1.0;
+	if (g_capturing.load())
+	{
+		tm = NowMs() - g_capStart;
+		std::lock_guard<std::mutex> lk(g_stickMu);
+		g_lookPitchMarks.emplace_back(tm, next);
+	}
+	if (tm >= 0) Log("=== F2: LookPitch %.2f -> %.2f (step %d of %d; capture t=%.0f ms) ===", (double)cur, (double)next, idx + 1, n, tm);
+	else Log("=== F2: LookPitch %.2f -> %.2f (step %d of %d) ===", (double)cur, (double)next, idx + 1, n);
+	Tone(idx == 0 ? 1 : idx, idx == 0 ? 500 : 1400);
+}
+
 static void SetMode(int m, const char* why)
 {
 	g_mode = m;
@@ -2577,7 +2646,6 @@ static void ToggleOpenClamp()
 
 static DWORD WINAPI WorkerThread(LPVOID)
 {
-	CreateThread(nullptr, 0, RawThread, nullptr, 0, nullptr);
 	InstallUser32Hooks();
 
 	// идентификатор сборки, профиль, cfg, якорь - всё тут, а не в DllMain (под блокировкой загрузчика не работаем)
@@ -2587,6 +2655,12 @@ static DWORD WINAPI WorkerThread(LPVOID)
 		(unsigned)g_timeDateStamp, (unsigned)g_sizeOfImage, (unsigned)g_imageBase, (unsigned)g_exeBase);
 	if (g_exeBase != g_imageBase) Log("WARNING: exe is loaded at %08X, not at its preferred base %08X; Rebase() assumes fixed addresses are shifted by the same delta", (unsigned)g_exeBase, (unsigned)g_imageBase);
 	LoadConfig();
+	// v4.10: поток Raw Input (эталон опытов v3/v4) только по ключу. Регистрация RIDEV_INPUTSINK держится, пока DirectInput игры не создал мышь;
+	// если DLL загрузить поздно (инжектором), она отняла бы мышь у DirectInput. Для исправлений эталон не нужен.
+	if (g_cfg.rawInputRef) CreateThread(nullptr, 0, RawThread, nullptr, 0, nullptr);
+	else Log("RawInput reference: off (cfg RawInputRef = 1 turns it on; only the v3/v4 experiments use it)");
+	g_lookPitch.store((float)g_cfg.lookPitch);
+	if (g_cfg.lookPitch != 1.0) Log("cfg: LookPitch=%.3f -> vertical of the normal camera (ground and magnetic surface, caller %08X) is multiplied; mouse only (F2 cycles 1 / 1.25 / 1.5 / 1.75 / 2 / 2.15)", g_cfg.lookPitch, (unsigned)kLookSmoothRet);
 	if (g_cfg.stickClamp > 0.0) Log("cfg: StickClamp=%g -> FUN_0040D820 this[3] is set to it on every call (the game value is 2.0)", g_cfg.stickClamp);
 	if (g_cfg.zeroGYaw != 1.0 || g_cfg.zeroGPitch != 1.0) Log("cfg: ZeroGYaw=%.3f ZeroGPitch=%.3f -> free-float (zero-g) smoother output is multiplied (caller %08X)", g_cfg.zeroGYaw, g_cfg.zeroGPitch, (unsigned)kZeroGSmoothRet);
 	if (g_cfg.aimLinear) Log("cfg: AimLinear=1 -> aim rotation is made linear (the game's 1x..2x gain ramp is removed) while F4 is ON; needs a tracer on ApplyRotDelta 00721BD0 with role = aimlin");
@@ -2595,7 +2669,7 @@ static DWORD WINAPI WorkerThread(LPVOID)
 
 	const double t0 = NowMs();
 	double nextSec = t0 + 1000.0, d3d9Seen = -1.0;
-	bool k3 = false, k4 = false, k5 = false, k6 = false, k7 = false, k8 = false, k9 = false, k10 = false, k11 = false;
+	bool k2 = false, k3 = false, k4 = false, k5 = false, k6 = false, k7 = false, k8 = false, k9 = false, k10 = false, k11 = false;
 	int marker = 0;
 
 	for (;;)
@@ -2613,11 +2687,13 @@ static DWORD WINAPI WorkerThread(LPVOID)
 		if (g_mode.load() != M_PASS && now - g_modeSince.load() > opt::kModeAutoRevertMs) { SetMode(M_PASS, "auto-revert after 2 min"); Tone(1, 300); }
 
 		const bool fg = GameFocused();
+		const bool n2 = fg && KeyDown(opt::kVkLookPitch);
 		const bool n3 = fg && KeyDown(opt::kVkWatch);
 		const bool n4 = fg && KeyDown(opt::kVkFollow);
 		const bool n5 = fg && KeyDown(opt::kVkBounce);
 		const bool n6 = fg && KeyDown(opt::kVkMarker), n7 = fg && KeyDown(opt::kVkStart), n8 = fg && KeyDown(opt::kVkStop);
 		const bool n9 = fg && KeyDown(opt::kVkMode), n10 = fg && KeyDown(opt::kVkInfo), n11 = fg && KeyDown(opt::kVkOpen);
+		if (n2 && !k2) CycleLookPitch();
 		if (n3 && !k3) { WatchToggle(); Tone(g_watchOn.load() ? 2 : 1, g_watchOn.load() ? 1300 : 500); }
 		if (n4 && !k4)
 		{
@@ -2647,7 +2723,7 @@ static DWORD WINAPI WorkerThread(LPVOID)
 		if (n9 && !k9) CycleMode();
 		if (n10 && !k10) { LogConditions("F10"); LogRegisteredRaw("F10"); }
 		if (n11 && !k11) ToggleOpenClamp();
-		k3 = n3; k4 = n4; k5 = n5; k6 = n6; k7 = n7; k8 = n8; k9 = n9; k10 = n10; k11 = n11;
+		k2 = n2; k3 = n3; k4 = n4; k5 = n5; k6 = n6; k7 = n7; k8 = n8; k9 = n9; k10 = n10; k11 = n11;
 
 		if (now >= nextSec)
 		{
