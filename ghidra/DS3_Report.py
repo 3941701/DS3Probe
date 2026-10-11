@@ -12,7 +12,7 @@
 #
 # Запуск: Window -> Script Manager -> положи файл в ~/ghidra_scripts -> Run (на открытой сборке).
 # Совместим по синтаксису и с Jython (Python 2.7), и с PyGhidra (Python 3).
-# НЕ проверялся автором внутри Ghidra (только py_compile) - если упадёт, пришли текст ошибки из консоли.
+# Отработал в настоящей Ghidra на базе 1.0.0.1 (октябрь 2026); если на другой базе упадёт - пришли текст ошибки из консоли.
 #
 # @category DS3Probe
 from __future__ import print_function
