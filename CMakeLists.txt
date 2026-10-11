@@ -7,9 +7,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Статический CRT (/MT): DLL запускается на любой машине без vcredist (аудит, 6.9)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-# Версия DLL в логе: SHA коммита (в GitHub Actions - из GITHUB_SHA, локально - из git)
+# Версия DLL в логе: SHA коммита. В GitHub Actions - DS3PROBE_HEAD_SHA (голова ветки PR; GITHUB_SHA у PR - тестовый
+# merge-коммит, которого нет в истории ветки), затем GITHUB_SHA; локально - из git.
 set(DS3PROBE_GIT_SHA "unknown")
-if(DEFINED ENV{GITHUB_SHA} AND NOT "$ENV{GITHUB_SHA}" STREQUAL "")
+if(DEFINED ENV{DS3PROBE_HEAD_SHA} AND NOT "$ENV{DS3PROBE_HEAD_SHA}" STREQUAL "")
+    string(SUBSTRING "$ENV{DS3PROBE_HEAD_SHA}" 0 7 DS3PROBE_GIT_SHA)
+elseif(DEFINED ENV{GITHUB_SHA} AND NOT "$ENV{GITHUB_SHA}" STREQUAL "")
     string(SUBSTRING "$ENV{GITHUB_SHA}" 0 7 DS3PROBE_GIT_SHA)
 else()
     find_package(Git QUIET)
